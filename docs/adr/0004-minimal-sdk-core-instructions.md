@@ -1,0 +1,3 @@
+# Keep SDK protocol instructions minimal and separate from application behavior
+
+The SDK will include one visible, versioned, always-present core instruction fragment containing only model-facing runtime facts and universal trust-boundary rules. Optional features add their own fragments only while active. SDK instructions own runtime facts while agent and run instructions own application behavior; structurally detectable configuration contradictions fail request compilation, without pretending arbitrary natural-language prompts can be proven consistent. This replaces the earlier no-core-fragment direction while retaining its purpose: preventing an opaque universal prompt from accumulating personality, style, product policy, or unrelated advice.

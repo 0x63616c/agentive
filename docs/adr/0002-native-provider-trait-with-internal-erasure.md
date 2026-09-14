@@ -1,0 +1,3 @@
+# Use a native provider trait with internal type erasure
+
+Provider authors will implement a native Rust trait whose asynchronous methods return `impl Future + Send`; the agent builder will erase concrete implementations behind an internal shared dynamic adapter. A generic `Agent<P>` would spread provider types through handles, sub-agents, and workflows, while a public boxed-future or `async-trait` contract would impose type-erasure mechanics on every provider author. Providers remain stable for an agent's lifetime, and runtime fallback or routing is expressed by a provider that composes other providers.
