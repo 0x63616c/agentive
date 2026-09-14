@@ -1,0 +1,7 @@
+error: tool `description` is required
+  --> tests/tool_macro/missing_description.rs:10:1
+   |
+10 | #[tool(name = "no_description")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)

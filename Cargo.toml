@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "agents",
+  "agents-macros",
+  "agents-test",
+]
+resolver = "2"
