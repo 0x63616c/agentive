@@ -26,6 +26,10 @@ async fn add(args: AddArgs) -> Result<AddResult, ToolError> {
 
 The macro leaves `add` directly callable and generates `AddTool`, the zero-sized `Tool` implementation. Register it with `.tool(AddTool)` on the agent builder. Names are explicit portable-ASCII contracts; duplicate effective names fail construction. The argument payload must be one typed structure (use an empty structure for no arguments), and runtime decoding rejects unknown fields before deserialization.
 
+Manual `Tool` implementations return a native `impl Future + Send` from `call`; they do not need to allocate or name a boxed future. The agent builder performs the lifetime-preserving type erasure only when a concrete tool enters its heterogeneous registry.
+
+When another component must retain a heterogeneous tool set, use the cloneable `ToolHandle::new(my_tool)` and register it with `AgentBuilder::tool_handle`. `ToolHandle` exposes the tool name, immutable metadata, and an ordinary async `call` without exposing the boxed registry future.
+
 `ToolContext` is not model input. Place it before the payload and mark it explicitly:
 
 ```rust,ignore

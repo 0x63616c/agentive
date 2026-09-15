@@ -26,6 +26,7 @@ impl AgentRunState {
                 tools: Vec::new(),
                 model: None,
                 max_output_tokens: 256,
+                output_format: crate::ModelOutputFormat::Text,
                 provider_max_attempts: 1,
                 max_parallel_tool_calls: 4,
                 context_estimate: AllOrError::Exact,
@@ -53,6 +54,7 @@ impl AgentRunState {
             usage: RunUsage::new(),
             budget,
             model_calls: 0,
+            provider_calls_started: 0,
             elapsed_ms: 0,
             reserved_child_model_calls: 0,
             reserved_tokens: 0,
@@ -104,20 +106,7 @@ impl AgentRunState {
             provider_call_id: effect_id.clone(),
             effect_id: effect_id.clone(),
             round,
-            request: ModelRequest {
-                instructions: self.plan.instructions.clone(),
-                messages: self.history.clone(),
-                tools: self
-                    .plan
-                    .tools
-                    .iter()
-                    .map(|policy| policy.descriptor.clone())
-                    .collect(),
-                include_context: true,
-                model: self.plan.model.clone(),
-                max_output_tokens: self.plan.max_output_tokens,
-                invocation_id: effect_id,
-            },
+            request: self.next_model_request(effect_id),
         })
     }
 
@@ -188,7 +177,8 @@ impl AgentRunState {
         let divisor = u32::try_from(child_count).unwrap_or(u32::MAX);
         Some(DelegationBudget {
             model_call_limit: self.budget.model_call_limit.saturating_sub(
-                self.model_calls
+                self.provider_calls_started
+                    .max(self.model_calls)
                     .saturating_add(self.reserved_child_model_calls),
             ) / divisor,
             token_limit: self
@@ -199,19 +189,40 @@ impl AgentRunState {
     }
 
     pub(super) fn no_provider_budget(&self) -> bool {
-        self.model_calls
+        self.provider_calls_started
+            .max(self.model_calls)
             .saturating_add(self.reserved_child_model_calls)
             >= self.budget.model_call_limit
-            || self.plan.token_limit.is_some_and(|limit| {
-                self.next_model_token_reservation() > limit.saturating_sub(self.reserved_tokens)
-            })
+            || self
+                .plan
+                .token_limit
+                .is_some_and(|limit| self.reserved_tokens >= limit)
     }
 
-    pub(super) fn next_model_token_reservation(&self) -> u64 {
-        crate::UsageEstimator.estimate_tokens(
-            &self.history,
-            self.plan.context_estimate,
-            self.plan.max_output_tokens,
-        )
+    pub(crate) fn next_model_token_reservation(&self) -> u64 {
+        let request =
+            self.next_model_request(format!("{}:provider:{}", self.run_id, self.model_calls));
+        let input_upper_bound = serde_json::to_vec(&request)
+            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
+        input_upper_bound.saturating_add(self.plan.max_output_tokens)
+    }
+
+    fn next_model_request(&self, effect_id: String) -> ModelRequest {
+        ModelRequest {
+            instructions: self.plan.instructions.clone(),
+            messages: self.history.clone(),
+            tools: self
+                .plan
+                .tools
+                .iter()
+                .map(|policy| policy.descriptor.clone())
+                .collect(),
+            include_context: true,
+            model: self.plan.model.clone(),
+            max_output_tokens: self.plan.max_output_tokens,
+            output_format: self.plan.output_format.clone(),
+            invocation_id: effect_id,
+        }
     }
 }

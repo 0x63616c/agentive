@@ -3,8 +3,9 @@
 
 use agentive::ModelCapabilities;
 use agentive::{
-    ModelFinishReason, ModelProvider, ModelRequest, ModelResponse, ModelTokenUsage, ModelToolCall,
-    ProviderCallContext, ProviderError, ProviderErrorKind,
+    ModelFinishReason, ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent,
+    ModelTokenUsage, ModelToolCall, ProviderCallContext, ProviderError, ProviderErrorKind,
+    StructuredOutputSupport, UsageEstimator,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,23 +13,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 
-/// A provider response that violates the reusable conformance contract.
-#[derive(Debug, thiserror::Error)]
-pub enum ProviderConformanceError {
-    /// The provider rejected the canonical request.
-    #[error("provider rejected conformance request: {0}")]
-    Provider(ProviderError),
-    /// A response contained a malformed correlated call.
-    #[error("provider returned malformed tool call: {0}")]
-    MalformedToolCall(String),
-    /// The provider advertised a capability it did not honor.
-    #[error("provider capability mismatch: {0}")]
-    Capability(String),
-}
+mod conformance;
+pub use conformance::{
+    ProviderConformanceError, ProviderConformanceHarness, ScriptedProviderHarness,
+    assert_provider_conformance,
+};
 
 #[derive(Debug, Clone)]
 pub enum ScriptedResult {
+    ExpectedRequest(ModelRequest),
     Response(ModelResponse),
+    Stream(Vec<Result<ModelStreamEvent, ProviderError>>),
     Error(ProviderError),
     Delay(Duration),
 }
@@ -40,6 +35,7 @@ struct ScriptedInner {
     cancellations: AtomicUsize,
     next_tool_call_id: AtomicUsize,
     capabilities: Mutex<ModelCapabilities>,
+    structured_output_support: Mutex<StructuredOutputSupport>,
 }
 
 impl Default for ScriptedInner {
@@ -53,10 +49,9 @@ impl Default for ScriptedInner {
                 supports_tool_calls: true,
                 supports_streaming: false,
                 supports_images: false,
-                supports_context_count_estimate: true,
                 max_context_tokens: Some(8192),
-                exact_context_counting: true,
             }),
+            structured_output_support: Mutex::new(StructuredOutputSupport::JsonSchema),
         }
     }
 }
@@ -120,6 +115,27 @@ impl ScriptedProvider {
         self.push(ScriptedResult::Error(error))
     }
 
+    /// Requires the next provider operation to receive this exact canonical request.
+    pub fn expect_request(self, request: ModelRequest) -> Self {
+        self.push(ScriptedResult::ExpectedRequest(request))
+    }
+
+    /// Appends one native provider stream, including its required terminal event.
+    pub fn respond_with_stream(self, events: Vec<Result<ModelStreamEvent, ProviderError>>) -> Self {
+        if let Ok(mut capabilities) = self.inner.capabilities.lock() {
+            capabilities.supports_streaming = true;
+        }
+        self.push(ScriptedResult::Stream(events))
+    }
+
+    /// Overrides the structured-output guarantee advertised by this provider.
+    pub fn structured_output_support(self, support: StructuredOutputSupport) -> Self {
+        if let Ok(mut stored) = self.inner.structured_output_support.lock() {
+            *stored = support;
+        }
+        self
+    }
+
     pub fn delay(self, duration: Duration) -> Self {
         self.push(ScriptedResult::Delay(duration))
     }
@@ -163,13 +179,6 @@ impl ScriptedProvider {
             .unwrap_or_else(|| panic!("expected at least one request"));
         assert!(last.tools.len() >= minimum);
     }
-
-    pub async fn conformance_test_step(&self, request: &ModelRequest) {
-        assert!(
-            !request.invocation_id.is_empty(),
-            "invocation_id must be present"
-        );
-    }
 }
 
 impl Clone for ScriptedProvider {
@@ -181,6 +190,27 @@ impl Clone for ScriptedProvider {
 }
 
 impl ModelProvider for ScriptedProvider {
+    fn structured_output_support(&self) -> StructuredOutputSupport {
+        self.inner
+            .structured_output_support
+            .lock()
+            .map_or(StructuredOutputSupport::None, |support| *support)
+    }
+    fn conservative_context_token_bound(
+        &self,
+        request: &ModelRequest,
+    ) -> Result<Option<u64>, String> {
+        UsageEstimator
+            .conservative_context_token_bound(request)
+            .map(Some)
+    }
+
+    fn exact_context_token_count(&self, request: &ModelRequest) -> Result<Option<u64>, String> {
+        serde_json::to_vec(request)
+            .map(|rendered| Some(u64::try_from(rendered.len()).unwrap_or(u64::MAX)))
+            .map_err(|error| format!("could not render scripted model request: {error}"))
+    }
+
     fn generate<'call>(
         &'call self,
         request: ModelRequest,
@@ -194,7 +224,7 @@ impl ModelProvider for ScriptedProvider {
                 .requests
                 .lock()
                 .expect("request lock")
-                .push(request);
+                .push(request.clone());
 
             let next = {
                 let mut script = this.inner.script.lock().expect("script lock");
@@ -214,12 +244,51 @@ impl ModelProvider for ScriptedProvider {
             let mut next = next;
             loop {
                 match next {
+                    ScriptedResult::ExpectedRequest(expected) => {
+                        if request != expected {
+                            return Err(ProviderError::terminal(
+                                ProviderErrorKind::Protocol,
+                                "scripted provider request did not match expectation",
+                            ));
+                        }
+                        next = this
+                            .inner
+                            .script
+                            .lock()
+                            .map_err(|_| {
+                                ProviderError::terminal(
+                                    ProviderErrorKind::Unavailable,
+                                    "scripted provider lock poisoned",
+                                )
+                            })?
+                            .pop_front()
+                            .ok_or_else(|| {
+                                ProviderError::terminal(
+                                    ProviderErrorKind::Unavailable,
+                                    "scripted provider exhausted after expectation",
+                                )
+                            })?;
+                    }
                     ScriptedResult::Response(response) => return Ok(response),
                     ScriptedResult::Error(error) => return Err(error),
+                    ScriptedResult::Stream(_) => {
+                        return Err(ProviderError::terminal(
+                            ProviderErrorKind::Protocol,
+                            "scripted stream was consumed through generate",
+                        ));
+                    }
                     ScriptedResult::Delay(duration) => {
+                        let notified = context.cancel_notifier.notified();
+                        if context.is_cancelled() {
+                            this.inner.cancellations.fetch_add(1, Ordering::SeqCst);
+                            return Err(ProviderError::terminal(
+                                ProviderErrorKind::Unknown,
+                                "scripted provider observed cancellation",
+                            ));
+                        }
                         tokio::select! {
                             () = sleep(duration) => {}
-                            () = context.cancel_notifier.notified() => {
+                            () = notified => {
                                 this.inner.cancellations.fetch_add(1, Ordering::SeqCst);
                                 return Err(ProviderError::terminal(
                                     ProviderErrorKind::Unknown,
@@ -250,70 +319,85 @@ impl ModelProvider for ScriptedProvider {
         })
     }
 
+    fn stream<'call>(
+        &'call self,
+        request: ModelRequest,
+        context: &'call ProviderCallContext,
+    ) -> impl std::future::Future<Output = Result<agentive::ModelStream, ProviderError>> + Send + 'call
+    {
+        let this = self.clone();
+        Box::pin(async move {
+            this.inner
+                .requests
+                .lock()
+                .expect("request lock")
+                .push(request.clone());
+            loop {
+                let next = this
+                    .inner
+                    .script
+                    .lock()
+                    .map_err(|_| {
+                        ProviderError::terminal(
+                            ProviderErrorKind::Unavailable,
+                            "scripted provider lock poisoned",
+                        )
+                    })?
+                    .pop_front()
+                    .ok_or_else(|| {
+                        ProviderError::terminal(
+                            ProviderErrorKind::Unavailable,
+                            "scripted provider exhausted",
+                        )
+                    })?;
+                match next {
+                    ScriptedResult::ExpectedRequest(expected) => {
+                        if request != expected {
+                            return Err(ProviderError::terminal(
+                                ProviderErrorKind::Protocol,
+                                "scripted provider request did not match expectation",
+                            ));
+                        }
+                    }
+                    ScriptedResult::Stream(events) => {
+                        return Ok(Box::pin(futures::stream::iter(events)) as agentive::ModelStream);
+                    }
+                    ScriptedResult::Error(error) => return Err(error),
+                    ScriptedResult::Response(_) => {
+                        return Err(ProviderError::terminal(
+                            ProviderErrorKind::Protocol,
+                            "scripted response was consumed through stream",
+                        ));
+                    }
+                    ScriptedResult::Delay(duration) => {
+                        let notified = context.cancel_notifier.notified();
+                        if context.is_cancelled() {
+                            this.inner.cancellations.fetch_add(1, Ordering::SeqCst);
+                            return Err(ProviderError::terminal(
+                                ProviderErrorKind::Unknown,
+                                "scripted provider observed cancellation",
+                            ));
+                        }
+                        tokio::select! {
+                            () = sleep(duration) => {}
+                            () = notified => {
+                                this.inner.cancellations.fetch_add(1, Ordering::SeqCst);
+                                return Err(ProviderError::terminal(
+                                    ProviderErrorKind::Unknown,
+                                    "scripted provider observed cancellation",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     fn capabilities(&self) -> ModelCapabilities {
         self.inner
             .capabilities
             .lock()
             .map_or_else(|_| ModelCapabilities::default(), |value| value.clone())
     }
-}
-
-pub async fn assert_provider_conformance<P>(provider: &P) -> Result<(), ProviderConformanceError>
-where
-    P: ModelProvider,
-{
-    let capabilities = provider.capabilities();
-    let context = ProviderCallContext {
-        provider_call_id: "conformance-call-id".to_string(),
-        model_round: 0,
-        attempt: 1,
-        remaining_time: Some(Duration::from_secs(1)),
-        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        cancel_notifier: Arc::new(tokio::sync::Notify::new()),
-    };
-
-    let request = ModelRequest {
-        instructions: agentive::CompiledInstructions {
-            core: agentive::InstructionFragment::new("test", 1, "test"),
-            agent: None,
-            run: None,
-            features: vec![],
-        },
-        messages: vec![agentive::Message::user("conformance input")],
-        tools: vec![agentive::ProviderToolDescriptor {
-            name: "conformance_tool"
-                .parse::<agentive::ToolName>()
-                .map_err(|error| ProviderConformanceError::MalformedToolCall(error.to_string()))?,
-            description: "Verify canonical tool mapping.".to_string(),
-            schema: serde_json::json!({"type":"object","additionalProperties":false}),
-            idempotent: true,
-        }],
-        include_context: true,
-        model: None,
-        max_output_tokens: 16,
-        invocation_id: "conformance-request".to_string(),
-    };
-
-    let response = provider
-        .generate(request, &context)
-        .await
-        .map_err(ProviderConformanceError::Provider)?;
-    if !capabilities.supports_tool_calls && !response.tool_calls.is_empty() {
-        return Err(ProviderConformanceError::Capability(
-            "provider returned tool calls while advertising no tool-call support".to_string(),
-        ));
-    }
-    for call in response.tool_calls {
-        if call.call_id.trim().is_empty() {
-            return Err(ProviderConformanceError::MalformedToolCall(
-                "tool call id is empty".to_string(),
-            ));
-        }
-        if call.name.as_str().is_empty() {
-            return Err(ProviderConformanceError::MalformedToolCall(
-                "tool name is empty".to_string(),
-            ));
-        }
-    }
-    Ok(())
 }

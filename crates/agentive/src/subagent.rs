@@ -6,7 +6,7 @@
 
 use crate::{
     Agent, AgentEffectOutcome, CancellationReason, DelegationBudget, RunOptions, RunStatus, Tool,
-    ToolCallFuture, ToolContext, ToolDecodeError, ToolError, ToolName, decode_tool_call_args,
+    ToolContext, ToolDecodeError, ToolError, ToolName, decode_tool_call_args,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ pub(crate) struct DelegationExecution {
     pub(crate) remaining: Option<std::time::Duration>,
     pub(crate) cancellation: crate::CancellationToken,
     pub(crate) delegation: (u8, u8),
+    pub(crate) max_parallel_tool_calls: usize,
     pub(crate) budget: Option<DelegationBudget>,
     pub(crate) observer: Option<crate::run::RunObserver>,
 }
@@ -140,6 +141,7 @@ impl DelegationTool {
                 deadline: execution.remaining,
                 model_call_limit: budget.model_call_limit.try_into().unwrap_or(usize::MAX),
                 token_limit: budget.token_limit,
+                max_parallel_tool_calls: execution.max_parallel_tool_calls,
                 max_delegation_depth: execution.delegation.1,
                 delegation_depth: execution.delegation.0.saturating_add(1),
                 ..RunOptions::default()
@@ -159,21 +161,50 @@ impl DelegationTool {
                         .map(|output| AgentEffectOutcome::Tool { output, attempts: 1, child_usage: Some(result.usage) })
                         .map_err(|_| crate::RunError::ProviderProtocol("delegation result could not be encoded".into()))
                 }
-                Ok(_) | Err(_) => Ok(safe_error("delegation_failed", "delegated agent failed")),
+                Ok(result) => Ok(safe_error_with_usage(
+                    "delegation_failed",
+                    "delegated agent failed",
+                    result.usage,
+                )),
+                Err(_) => Ok(safe_error_with_usage(
+                    "delegation_failed",
+                    "delegated agent failed",
+                    handle.usage_snapshot(),
+                )),
             },
             _ = execution.cancellation.cancelled() => {
                 handle.cancel_with(CancellationReason::Parent);
-                Ok(safe_error("delegation_cancelled", "delegation was cancelled"))
+                let usage = handle
+                    .wait()
+                    .await
+                    .map_or_else(|_| handle.usage_snapshot(), |result| result.usage);
+                Ok(safe_error_with_usage(
+                    "delegation_cancelled",
+                    "delegation was cancelled",
+                    usage,
+                ))
             }
         }
     }
 }
 
 fn safe_error(code: &str, message: &str) -> AgentEffectOutcome {
+    safe_error_with_optional_usage(code, message, None)
+}
+
+fn safe_error_with_usage(code: &str, message: &str, usage: crate::RunUsage) -> AgentEffectOutcome {
+    safe_error_with_optional_usage(code, message, Some(usage))
+}
+
+fn safe_error_with_optional_usage(
+    code: &str,
+    message: &str,
+    child_usage: Option<crate::RunUsage>,
+) -> AgentEffectOutcome {
     AgentEffectOutcome::Tool {
         output: serde_json::json!({ "error": { "code": code, "message": message } }),
         attempts: 1,
-        child_usage: None,
+        child_usage,
     }
 }
 
@@ -198,8 +229,13 @@ impl Tool for DelegationTool {
         self.parallel_safe
     }
 
-    fn call<'call>(&'call self, context: &'call ToolContext, args: Value) -> ToolCallFuture<'call> {
-        Box::pin(async move {
+    #[allow(clippy::manual_async_fn)]
+    fn call<'call>(
+        &'call self,
+        context: &'call ToolContext,
+        args: Value,
+    ) -> impl std::future::Future<Output = Result<Value, ToolError>> + Send + 'call {
+        async move {
             let request = decode_tool_call_args::<DelegationRequest>(args)
                 .map_err(decode_error_to_tool_error)?;
             if request.task.trim().is_empty() {
@@ -254,7 +290,7 @@ impl Tool for DelegationTool {
                     Err(ToolError::terminal("delegation_cancelled", "delegation was cancelled"))
                 }
             }
-        })
+        }
     }
 }
 

@@ -36,7 +36,8 @@ let request = ModelRequest {
     tools: vec![],
     include_context: true,
     model: None,
-    max_output_tokens: 256,
+    max_output_tokens: 0,
+    output_format: agentive::ModelOutputFormat::Text,
     invocation_id: "example".to_owned(),
 };
 let response = runtime.run(request).await?;
@@ -44,3 +45,8 @@ println!("{}", response.text.unwrap_or_default());
 # Ok(())
 # }
 ```
+
+The current App Server protocol has no lossless final-output-token cap, so this
+runtime requires `include_context: true` and `max_output_tokens: 0` (explicitly
+uncapped). Unsupported constraints fail before a process is opened; usage is
+still returned when App Server reports it.

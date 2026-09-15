@@ -374,18 +374,15 @@ impl WeatherTool {
 
 ## Manual tool escape hatch
 
-**Accepted architecture; exact names remain proposed.** Protocol adapters and unusual tools can implement the typed authoring trait directly. Registries contain `DynTool`, which erases associated types and the returned future.
+**Accepted architecture; exact names remain proposed.** Protocol adapters and unusual tools can implement the public trait directly. Its `call` method returns a native shared-lifetime future; the registry alone erases and boxes that future to store heterogeneous tools.
 
 ```rust
 impl Tool for WeatherTool {
-    type Args = WeatherArgs;
-    type Output = WeatherReport;
-
     fn call<'a>(
         &'a self,
         context: &'a ToolContext,
-        args: WeatherArgs,
-    ) -> impl Future<Output = Result<WeatherReport, ToolError>> + Send + 'a {
+        args: serde_json::Value,
+    ) -> impl Future<Output = Result<ToolOutput, ToolError>> + Send + 'a {
         async move {
             tokio::select! {
                 result = self.client.fetch(&args.city) => {
@@ -400,7 +397,7 @@ impl Tool for WeatherTool {
 }
 ```
 
-The erased registry interface works only with JSON values and boxed futures.
+The internal erased registry interface works only with JSON values and boxed futures; it is not the public authoring API.
 
 ```rust
 trait ErasedTool: Send + Sync {
@@ -413,8 +410,7 @@ trait ErasedTool: Send + Sync {
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>>;
 }
 
-#[derive(Clone)]
-pub struct DynTool(Arc<dyn ErasedTool>);
+struct ToolRegistryAdapter<T>(T);
 ```
 
 ## Tool errors

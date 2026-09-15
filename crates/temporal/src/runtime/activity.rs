@@ -1,13 +1,19 @@
 //! The non-deterministic activity boundary for one canonical Agentive effect.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use agentive::{
     Agent, AgentEffectOutcome, AgentRunEffect, AgentRunState, CancellationReason, CancellationToken,
 };
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
-use temporalio_sdk::activities::{ActivityContext, ActivityError};
+use temporalio_sdk::{
+    ApplicationFailure,
+    activities::{ActivityContext, ActivityError},
+};
 
 const CANCELLATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const PROVIDER_CANCELLATION_ACK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -19,6 +25,34 @@ pub struct EffectActivityInput {
     pub state: AgentRunState,
     /// Exact effect selected from that snapshot.
     pub effect: AgentRunEffect,
+}
+
+/// Canonical effect result plus the activity-measured elapsed duration persisted in history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EffectActivityOutput {
+    /// The current result format, including activity elapsed time.
+    Reported {
+        /// The effect outcome selected by the canonical state machine.
+        outcome: AgentEffectOutcome,
+        /// Whole milliseconds spent executing the activity.
+        elapsed_ms: u64,
+    },
+    /// A pre-elapsed-time history result. It consumes no durable deadline budget.
+    Legacy(AgentEffectOutcome),
+}
+
+impl EffectActivityOutput {
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (AgentEffectOutcome, u64) {
+        match self {
+            Self::Reported {
+                outcome,
+                elapsed_ms,
+            } => (outcome, elapsed_ms),
+            Self::Legacy(outcome) => (outcome, 0),
+        }
+    }
 }
 
 /// Activities bound to one immutable Agentive provider and tool definition.
@@ -45,7 +79,8 @@ impl AgentiveActivities {
         self: Arc<Self>,
         context: ActivityContext,
         input: EffectActivityInput,
-    ) -> Result<AgentEffectOutcome, ActivityError> {
+    ) -> Result<EffectActivityOutput, ActivityError> {
+        let started = Instant::now();
         let cancellation = CancellationToken::new();
         let execution = self
             .agent
@@ -66,7 +101,15 @@ impl AgentiveActivities {
                             .await;
                     return Err(ActivityError::cancelled());
                 }
-                outcome = &mut execution => return outcome.map_err(ActivityError::from),
+                outcome = &mut execution => return outcome
+                    .map(|outcome| EffectActivityOutput::Reported {
+                        outcome,
+                        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    })
+                    // Agentive returns errors only for deterministic configuration/protocol
+                    // failures (its provider/tool failures are canonical outcomes). They must
+                    // not consume Temporal's infrastructure-redelivery policy.
+                    .map_err(|error| ActivityError::application(ApplicationFailure::non_retryable(error))),
                 _ = heartbeat.tick() => {
                     if let Err(error) = context.record_heartbeat(()).await {
                         if context.is_cancelled() {

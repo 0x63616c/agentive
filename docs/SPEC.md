@@ -78,7 +78,7 @@ Delivery is incremental: the local vertical core, Codex integration, sub-agent c
 ### Product boundary and workspace
 
 - Preserve useful core behavior from `agenticenv/agent-sdk-go` through idiomatic Rust APIs. Source and package-shape compatibility are not goals.
-- Begin with `agentive`, `agentive-macros`, `agentive-test`, and the first working Codex integration crate. Add `agentive-temporal` when that slice begins. Do not scaffold empty future crates.
+- Begin with the `agentive-sdk` package (whose library crate is imported as `agentive`), `agentive-macros`, `agentive-test`, and the first working Codex integration crate. Add `agentive-temporal` when that slice begins. Do not scaffold empty future crates. The package/library distinction preserves the concise Rust import while avoiding the unrelated pre-existing crates.io package named `agentive`.
 - Keep provider, protocol, storage, telemetry-export, and durable-runtime dependencies outside core.
 - Use Tokio as the v1 runtime. Public streaming uses standard `Stream` vocabulary rather than Tokio channels.
 - Set workspace `rust-version = "1.94"` for v1. Test that exact MSRV alongside current stable, require every selected dependency to support it, and raise it only in a documented minor release.
@@ -149,7 +149,7 @@ Delivery is incremental: the local vertical core, Codex integration, sub-agent c
 - Successful outputs implement `Serialize` and become canonical `serde_json::Value`; there is no display/debug fallback. Binary and streaming results are deferred in favor of structured resource references.
 - Tool names and error codes use validated portable-ASCII newtypes, checked at compile time for macro literals and parsed once for runtime configuration.
 - Reject duplicate effective tool names during agent construction. Dynamic collision rejection is atomic and preserves the existing tool.
-- A run captures one immutable tool-registry snapshot before compiling its first provider request. Dynamic registrations and removals affect only later runs; they cannot change schemas or dispatch targets midway through an active run.
+- `AgentBuilder` freezes one immutable tool registry when the agent is built. Changing tools means building a new `Agent`; an active run can never observe schema or dispatch mutation.
 
 ### Tool context, errors, and retrying
 
@@ -188,6 +188,7 @@ Delivery is incremental: the local vertical core, Codex integration, sub-agent c
 ### Runtime-neutral durability and Temporal
 
 - Model the loop as a serializable deterministic state machine with explicit effects. Local and Temporal executors drive the same transitions.
+- Create durable input through `Agent::prepare_state`; the worker recomputes and enforces its frozen tool descriptors, retry limits, concurrency flags, and delegation policy before every effect, so serialized state cannot broaden worker authority.
 - Keep Temporal concepts out of provider-neutral core APIs.
 - Persist stable workflow/pipeline fingerprints, reject unexplained incompatibility, support explicit migrations, and Continue-As-New deterministically before history limits.
 - Durable identity, retries, usage, messages, and pending effects survive restarts. Time, randomness, IDs, provider calls, and tool calls cross explicit effect boundaries.
@@ -215,7 +216,10 @@ Delivery is incremental: the local vertical core, Codex integration, sub-agent c
 - Protected CI is authoritative; Git hooks are optional. Provide one local command matching CI and add an `xtask` only when justified.
 - Require formatting, warning-free Clippy, nextest, doctests, MSRV checks, feature combinations, warning-free rustdoc, dependency/license/advisory policy, platform checks, and conformance suites.
 - Add semver checks after the first published release. Ratchet coverage without substituting it for behavioral tests.
-- Schedule dependency-resolution checks, decoder fuzzing, and opt-in live Codex smoke tests. Live tests never expose credentials or block ordinary development.
+- Schedule dependency-resolution checks and decoder fuzzing. Keep the live Codex
+  smoke as an explicit opt-in release gate on a locally authenticated machine;
+  it may be scheduled only when a protected authenticated runner is deliberately
+  configured. Live tests never expose credentials or block ordinary development.
 
 ## Delivery Slices and Exit Criteria
 
@@ -236,7 +240,7 @@ A later slice may define internal traits needed by an earlier one, but it may no
 - Run a reusable conformance suite against the scripted provider and every applicable live integration, covering capabilities, request preservation, streams, errors, cancellation, correlation, and usage.
 - Test Codex protocol behavior against version-matched schemas or safe fixtures and a controlled fake App Server. Subscription smoke tests are explicit and opt-in.
 - Test provider-call cancellation and deadline propagation through the public call context, including cancellation of a live Codex turn and late-response rejection.
-- Unit-test tool functions and stateful methods directly. Registry tests cover schemas, strict decoding, structured output, safe errors, idempotency, retry identity, cancellation, timeouts, collisions, panics, and serialization failures.
+- Unit-test tool functions and stateful methods directly. Registry tests cover schemas, strict decoding, structured output, safe errors, idempotency, retry identity, cancellation, timeouts, build-time collisions, panics, and serialization failures.
 - Use `trybuild` for macro compile-pass/fail contracts. Use selective snapshots for schemas, expansion, compiled instructions, XML rendering, wire fixtures, and event sequences.
 - Use property tests for state transitions, terminal exclusivity, serialization, malformed inputs, ordering, validated names, traversal resistance, codec reversibility, and size/checksum enforcement.
 - Inject deterministic time, IDs, randomness, providers, and tools at effect boundaries; do not sleep where a controllable clock suffices.

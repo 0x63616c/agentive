@@ -1,7 +1,8 @@
 # Install and quickstart
 
 ```sh
-cargo add agentive agentive-test
+cargo add agentive-sdk --rename agentive
+cargo add agentive-test
 ```
 
 The smallest complete run uses `ScriptedProvider`, which makes the provider response explicit and repeatable:

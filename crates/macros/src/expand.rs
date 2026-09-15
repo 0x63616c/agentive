@@ -129,17 +129,25 @@ fn tool_implementation(
                 &'call self,
                 context: &'call agentive::ToolContext,
                 args: serde_json::Value,
-            ) -> agentive::ToolCallFuture<'call> {
-                Box::pin(async move {
+            ) -> impl std::future::Future<Output = Result<serde_json::Value, agentive::ToolError>> + Send + 'call {
+                async move {
                     let args: #args_ty = agentive::decode_tool_call_args(args).map_err(|error| {
-                        agentive::ToolError::terminal("invalid_arguments", error.to_string())
+                        let _ = error;
+                        agentive::ToolError::terminal(
+                            "invalid_arguments",
+                            "tool arguments did not match the published schema",
+                        )
                     })?;
                     let output: #output_ty = (#invocation)
                         .map_err(|error| -> agentive::ToolError { error.into() })?;
                     serde_json::to_value(output).map_err(|error| {
-                        agentive::ToolError::terminal("serialize_error", error.to_string())
+                        let _ = error;
+                        agentive::ToolError::terminal(
+                            "tool_output_unavailable",
+                            "tool output could not be encoded",
+                        )
                     })
-                })
+                }
             }
         }
     }

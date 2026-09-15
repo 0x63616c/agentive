@@ -22,20 +22,26 @@ nested Agentive loop.
 
 ## Live smoke test
 
-The ignored smoke test is opt-in and must be run only by a developer who is
+The ignored smoke test is an explicit manual release gate and must be run by a developer who is
 already authenticated in local Codex. It does not take an API key and never
-prints account data. Run it with:
+prints account data. Hosted CI deliberately cannot run it because no developer
+subscription session is installed there. Run it with:
 
 ```text
-AGENTIVE_CODEX_LIVE=1 cargo test -p agentive-codex live_subscription_text_tool_usage_and_process_lifecycle -- --ignored
+AGENTIVE_CODEX_LIVE=1 cargo test -p agentive-codex live_subscription_text_tool_usage_and_process_reaping -- --ignored
 ```
 
 The prepared release-evidence test is
-`live_subscription_text_tool_usage_and_process_lifecycle`. A read-only
+`live_subscription_text_tool_usage_and_process_reaping`. A read-only
 `model/list` request to installed Codex Desktop 0.153.4 on 2026-09-14 listed
 `gpt-5.6-luna` as “Fast and affordable”, with text/image capability and a fast
 service tier. Subscription pricing is not exposed by App Server, so this is the
 smallest/fastest metadata-based choice rather than a price claim.
+
+Release evidence: the test passed on 2026-09-14 with `gpt-5.6-luna`. It completed
+one authenticated subscription run, invoked the registered tool exactly once,
+returned exactly `done`, reported usage, and released the child process. The
+runtime now closes, terminates when necessary, and reaps every stdio session.
 
 ## OpenClaw comparison
 

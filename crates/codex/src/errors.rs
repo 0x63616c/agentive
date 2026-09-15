@@ -46,3 +46,12 @@ pub(crate) fn protocol_error() -> ProviderError {
         "unsupported codex app server protocol",
     )
 }
+pub(crate) fn cancelled_error() -> ProviderError {
+    ProviderError::terminal(ProviderErrorKind::Timeout, "codex turn was cancelled")
+}
+pub(crate) fn phase_timeout_error() -> ProviderError {
+    ProviderError::retryable(
+        ProviderErrorKind::Timeout,
+        "codex app server protocol phase timed out",
+    )
+}

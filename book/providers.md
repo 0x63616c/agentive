@@ -33,7 +33,23 @@ impl ModelProvider for EchoProvider {
 
 Capabilities are a contract. `ModelCapabilities` declares tool, streaming, image, and context-admission support. If a requested canonical capability cannot be preserved, reject it explicitly; adapters must not silently discard images, schemas, instructions, or tool correlation. `stream` is optional on the trait and returns an owned `ModelStream` when supported.
 
-The deterministic `agentive-test::ScriptedProvider` implements this same public trait. Script responses, tool calls, delays, and classified failures; then assert the whole script is consumed and inspect `recorded_requests()` when prompt or schema shape matters:
+Structured output is equally explicit. Providers advertise `StructuredOutputSupport::{None, Json, JsonSchema}`. `run_structured::<T>` derives the exact schema from `T`, rejects an incapable provider before transport, deserializes the final JSON, and preserves the complete run and usage:
+
+```rust,ignore
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct Answer {
+    value: String,
+}
+
+# async fn example(agent: &agentive::Agent) -> Result<(), agentive::RunError> {
+let result = agent.run_structured::<Answer>("Answer as JSON").await?;
+println!("{}", result.value.value);
+println!("{:?}", result.run.usage.aggregate);
+# Ok(())
+# }
+```
+
+The deterministic `agentive-test::ScriptedProvider` implements this same public trait. Script responses, native stream chunks, tool calls, delays, and classified failures; then assert the whole script is consumed and inspect `recorded_requests()` when prompt or schema shape matters:
 
 ```rust,ignore
 use agentive::{Agent, RunStatus};

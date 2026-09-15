@@ -5,10 +5,10 @@ mod config;
 mod handle;
 mod workflow;
 
-pub use activity::{AgentiveActivities, EffectActivityInput};
+pub use activity::{AgentiveActivities, EffectActivityInput, EffectActivityOutput};
 pub use config::{
     ADAPTER_SCHEMA_VERSION, TemporalRunConfig, TemporalRunConfigError, TemporalRunCursor,
-    TemporalRunSnapshot, TemporalWorkflowInput,
+    TemporalRunSnapshot, TemporalWorkflowInput, WORKFLOW_FINGERPRINT, WorkflowFingerprint,
 };
 pub use handle::{TemporalRunHandle, TemporalRuntime};
 pub use workflow::AgentiveWorkflow;

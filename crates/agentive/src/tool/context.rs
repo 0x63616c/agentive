@@ -2,14 +2,14 @@ use crate::ids::{IdempotencyKey, ToolInvocationId, ToolName};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::Notify;
 
 /// A shared, runtime-neutral cancellation signal for a run or tool invocation.
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
     cancelled: std::sync::Arc<AtomicBool>,
     notifier: std::sync::Arc<Notify>,
-    reason: std::sync::Arc<RwLock<Option<CancellationReason>>>,
+    reason: std::sync::Arc<std::sync::Mutex<Option<CancellationReason>>>,
 }
 impl CancellationToken {
     /// Creates a token that has not been cancelled.
@@ -18,33 +18,37 @@ impl CancellationToken {
         Self {
             cancelled: std::sync::Arc::new(AtomicBool::new(false)),
             notifier: std::sync::Arc::new(Notify::new()),
-            reason: std::sync::Arc::new(RwLock::new(None)),
+            reason: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
     /// Marks the token cancelled and wakes all waiters.
     pub fn cancel(&self, reason: CancellationReason) {
-        if let Ok(mut recorded_reason) = self.reason.try_write() {
+        if let Ok(mut recorded_reason) = self.reason.lock()
+            && recorded_reason.is_none()
+        {
             *recorded_reason = Some(reason);
+            self.cancelled.store(true, Ordering::Release);
+            drop(recorded_reason);
+            self.notifier.notify_waiters();
         }
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.notifier.notify_waiters();
     }
     /// Returns whether cancellation has already been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::Acquire)
     }
     /// Waits for cancellation and returns its recorded reason.
     pub async fn cancelled(&self) -> CancellationReason {
         loop {
+            let notified = self.notifier.notified();
             if self.is_cancelled() {
                 return self
                     .reason
-                    .read()
-                    .await
-                    .clone()
+                    .lock()
+                    .ok()
+                    .and_then(|reason| reason.clone())
                     .unwrap_or(CancellationReason::Runtime);
             }
-            self.notifier.notified().await;
+            notified.await;
         }
     }
     pub(crate) fn flag(&self) -> std::sync::Arc<AtomicBool> {
@@ -63,21 +67,84 @@ impl Default for CancellationToken {
 /// Stable identity and policy context for a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolInvocation {
+    /// Stable identity of the owning run.
     pub run_id: String,
+    /// Stable logical identity of this invocation.
     pub invocation_id: ToolInvocationId,
+    /// Provider-supplied call identity, when available.
     pub provider_call_id: Option<String>,
+    /// Validated name of the invoked tool.
     pub tool_name: ToolName,
+    /// Zero-based provider model round that requested the invocation.
     pub model_round: u32,
+    /// Caller-supplied key used to deduplicate the logical invocation.
     pub idempotency_key: IdempotencyKey,
 }
 
 /// Cause supplied when a running operation is cancelled.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancellationReason {
+    /// A user requested cancellation.
     User,
+    /// The parent run cancelled this operation.
     Parent,
+    /// The operation exhausted its deadline.
     Timeout,
+    /// The owning runtime cancelled the operation.
     Runtime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CancellationReason, CancellationToken};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancellation_wakes_waiters_and_retains_the_first_reason() {
+        let token = CancellationToken::new();
+        let waiting = token.clone();
+        let waiter = tokio::spawn(async move { waiting.cancelled().await });
+        tokio::task::yield_now().await;
+        token.cancel(CancellationReason::Parent);
+        token.cancel(CancellationReason::User);
+        match waiter.await {
+            Ok(reason) => assert_eq!(reason, CancellationReason::Parent),
+            Err(error) => panic!("waiter failed: {error}"),
+        }
+        assert_eq!(token.cancelled().await, CancellationReason::Parent);
+    }
+
+    #[tokio::test]
+    async fn racing_cancellers_publish_one_canonical_reason() {
+        let token = CancellationToken::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first = {
+            let token = token.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                token.cancel(CancellationReason::User);
+            })
+        };
+        let second = {
+            let token = token.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                token.cancel(CancellationReason::Timeout);
+            })
+        };
+        barrier.wait().await;
+        assert!(first.await.is_ok());
+        assert!(second.await.is_ok());
+
+        let reason = token.cancelled().await;
+        assert!(matches!(
+            reason,
+            CancellationReason::User | CancellationReason::Timeout
+        ));
+        assert_eq!(token.cancelled().await, reason);
+    }
 }
 
 /// Runtime context supplied to a tool invocation.
@@ -165,7 +232,9 @@ impl ToolContext {
 #[derive(Debug, Error)]
 pub enum ToolDecodeError {
     #[error("tool argument decode failed: {0}")]
+    /// The arguments contain fields not accepted by the tool.
     UnknownFields(String),
     #[error("tool schema validation failed: {0}")]
+    /// The arguments do not satisfy the declared tool schema.
     InvalidSchema(String),
 }

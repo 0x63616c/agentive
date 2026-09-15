@@ -1,11 +1,64 @@
 #![allow(missing_docs, clippy::expect_used, clippy::unwrap_used)]
 
 use agentive::{
-    AgentRunBudget, AgentRunEffect, AgentRunState, ModelFinishReason, ModelResponse, ModelToolCall,
-    ToolName,
+    AgentEffectOutcome, AgentRunBudget, AgentRunEffect, AgentRunPlan, AgentRunState, AllOrError,
+    CompiledInstructions, InstructionFragment, ModelFinishReason, ModelResponse, ModelToolCall,
+    ProviderToolDescriptor, RunStatus, ToolName, ToolRuntimePolicy,
 };
 use proptest::prelude::*;
 use serde_json::json;
+
+fn token_plan(
+    token_limit: Option<u64>,
+    description: String,
+    schema: serde_json::Value,
+) -> AgentRunPlan {
+    AgentRunPlan {
+        instructions: CompiledInstructions {
+            core: InstructionFragment::new("test", 1, "core"),
+            agent: Some("agent instruction ".repeat(256)),
+            run: Some("run instruction ".repeat(128)),
+            features: vec![],
+        },
+        tools: vec![ToolRuntimePolicy {
+            descriptor: ProviderToolDescriptor {
+                name: ToolName::parse("large_contract").expect("name"),
+                description,
+                schema,
+                idempotent: false,
+            },
+            idempotent: false,
+            max_attempts: 1,
+            parallel_safe: false,
+            delegation: false,
+        }],
+        model: None,
+        max_output_tokens: 7,
+        output_format: agentive::ModelOutputFormat::Text,
+        provider_max_attempts: 1,
+        max_parallel_tool_calls: 1,
+        context_estimate: AllOrError::Exact,
+        provider_enforced_limit_opt_out: false,
+        deadline_ms: None,
+        delegation_depth: 0,
+        max_delegation_depth: 4,
+        token_limit,
+    }
+}
+
+fn provider_reservation(state: &AgentRunState) -> u64 {
+    let AgentRunEffect::ProviderCall { request, .. } = state.next_effect().expect("provider")
+    else {
+        panic!("expected provider effect");
+    };
+    u64::try_from(
+        serde_json::to_vec(&request)
+            .expect("canonical request")
+            .len(),
+    )
+    .expect("request length fits u64")
+    .saturating_add(request.max_output_tokens)
+}
 
 #[test]
 fn tool_effect_identity_is_stable_across_replay_and_round_trip() {
@@ -69,6 +122,134 @@ fn provider_effect_carries_the_exact_serialized_request_and_stable_identity() {
 }
 
 #[test]
+fn provider_budget_exhaustion_commits_as_a_deterministic_terminal_outcome() {
+    let large = "x".repeat(8_192);
+    let schema = json!({ "description": large, "properties": { "value": { "description": "y".repeat(8_192) } } });
+    let state = AgentRunState::with_plan(
+        "token-boundary",
+        vec![agentive::Message::user("start")],
+        AgentRunBudget {
+            model_call_limit: 2,
+        },
+        token_plan(None, "tool description ".repeat(512), schema.clone()),
+    );
+    let reservation = provider_reservation(&state);
+    assert!(
+        reservation > 16_000,
+        "the full canonical request is reserved"
+    );
+    let mut rejected = AgentRunState::with_plan(
+        "token-boundary",
+        vec![agentive::Message::user("start")],
+        AgentRunBudget {
+            model_call_limit: 2,
+        },
+        token_plan(
+            Some(reservation.saturating_sub(1)),
+            "tool description ".repeat(512),
+            schema,
+        ),
+    );
+    let effect = rejected.next_effect().expect("provider admission effect");
+    let AgentRunEffect::ProviderCall { effect_id, .. } = effect else {
+        panic!("first effect must be provider admission");
+    };
+    rejected
+        .commit_effect(
+            &effect_id,
+            AgentEffectOutcome::ProviderBudgetExhausted {
+                required_tokens: reservation,
+            },
+        )
+        .expect("provider-derived rejection commits deterministically");
+    assert_eq!(rejected.status, RunStatus::Incomplete);
+    assert!(rejected.next_effect().is_none());
+}
+
+#[test]
+fn history_growth_after_a_tool_turn_blocks_the_next_provider_call() {
+    let mut state = AgentRunState::new(
+        "growing-history",
+        vec![agentive::Message::user("start")],
+        AgentRunBudget {
+            model_call_limit: 2,
+        },
+    );
+    let reservation = provider_reservation(&state);
+    state.plan.token_limit = Some(reservation);
+    state
+        .commit_provider_response(
+            "growing-history:provider:0",
+            ModelResponse {
+                text: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call".into(),
+                    name: ToolName::parse("unknown").expect("name"),
+                    arguments: json!({ "payload": "a tool result grows history" }),
+                    provider_call_id: None,
+                }],
+                usage: None,
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+        )
+        .expect("first provider call is admitted at the exact boundary");
+    state
+        .commit_tool_result(
+            "growing-history:tool:call",
+            json!({ "output": "tool result" }),
+        )
+        .expect("tool result");
+
+    assert!(state.next_effect().is_none());
+    assert!(state.finish_if_exhausted());
+    assert_eq!(state.status, RunStatus::Incomplete);
+}
+
+#[test]
+fn delegation_reservation_never_exceeds_unreserved_hard_token_budget() {
+    let mut state = AgentRunState::with_plan(
+        "delegation-token-ledger",
+        vec![agentive::Message::user("start")],
+        AgentRunBudget {
+            model_call_limit: 3,
+        },
+        token_plan(None, "delegate".into(), json!({})),
+    );
+    state.plan.tools[0].delegation = true;
+    let first_reservation = provider_reservation(&state);
+    state.plan.token_limit = Some(first_reservation.saturating_add(60));
+    state
+        .commit_provider_response(
+            "delegation-token-ledger:provider:0",
+            ModelResponse {
+                text: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "child".into(),
+                    name: ToolName::parse("large_contract").expect("name"),
+                    arguments: json!({}),
+                    provider_call_id: None,
+                }],
+                usage: None,
+                finish_reason: ModelFinishReason::ToolCalls,
+            },
+        )
+        .expect("provider transition");
+
+    let AgentRunEffect::ToolCall {
+        delegation_budget: Some(reservation),
+        ..
+    } = state.next_effect().expect("delegation effect")
+    else {
+        panic!("expected delegation reservation");
+    };
+    assert!(reservation.token_limit.expect("token budget") <= 60);
+    state
+        .commit_tool_result("delegation-token-ledger:tool:child", json!({"ok": true}))
+        .expect("delegation completion");
+    assert!(state.reserved_tokens <= state.plan.token_limit.expect("token limit"));
+}
+
+#[test]
 fn parallel_safe_pending_calls_form_one_ordered_batch_effect() {
     let name = ToolName::parse("echo").expect("name");
     let plan = agentive::AgentRunPlan {
@@ -92,6 +273,7 @@ fn parallel_safe_pending_calls_form_one_ordered_batch_effect() {
         }],
         model: None,
         max_output_tokens: 8,
+        output_format: agentive::ModelOutputFormat::Text,
         provider_max_attempts: 1,
         max_parallel_tool_calls: 2,
         context_estimate: agentive::AllOrError::Exact,
@@ -264,7 +446,7 @@ fn exhausted_budget_is_a_deterministic_incomplete_terminal_state() {
 }
 
 #[test]
-fn unified_effect_commit_and_terminal_failure_are_serializable() {
+fn terminal_state_is_serializable_and_cannot_be_overwritten() {
     let mut state = AgentRunState::new(
         "run-5",
         vec![],
@@ -282,16 +464,64 @@ fn unified_effect_commit_and_terminal_failure_are_serializable() {
                     usage: None,
                     finish_reason: ModelFinishReason::Stop,
                 },
+                attempts: Vec::new(),
             },
         )
         .expect("effect commit");
     assert_eq!(state.text.as_deref(), Some("done"));
     state.fail("safe failure");
+    state.cancel();
     let restored: AgentRunState =
         serde_json::from_str(&serde_json::to_string(&state).expect("serialize"))
             .expect("deserialize");
-    assert_eq!(restored.error.as_deref(), Some("safe failure"));
-    assert_eq!(restored.status, agentive::RunStatus::Failed);
+    assert_eq!(restored.error, None);
+    assert_eq!(restored.status, agentive::RunStatus::Completed);
+
+    let mut failed = AgentRunState::new(
+        "failed",
+        vec![],
+        AgentRunBudget {
+            model_call_limit: 1,
+        },
+    );
+    failed.fail("first failure");
+    failed.fail("replacement failure");
+    failed.cancel();
+    assert_eq!(failed.status, agentive::RunStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("first failure"));
+}
+
+#[test]
+fn legacy_state_without_transport_call_counter_preserves_exhausted_budget() {
+    let mut state = AgentRunState::new(
+        "legacy",
+        vec![],
+        AgentRunBudget {
+            model_call_limit: 1,
+        },
+    );
+    state
+        .commit_provider_response(
+            "legacy:provider:0",
+            ModelResponse {
+                text: None,
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: ModelFinishReason::Stop,
+            },
+        )
+        .expect("commit");
+    state.status = RunStatus::Running;
+    let mut legacy = serde_json::to_value(state).expect("serialize");
+    legacy
+        .as_object_mut()
+        .expect("state object")
+        .remove("provider_calls_started");
+
+    let mut restored: AgentRunState = serde_json::from_value(legacy).expect("legacy state");
+
+    assert!(restored.finish_if_exhausted());
+    assert_eq!(restored.status, RunStatus::Incomplete);
 }
 
 proptest! {

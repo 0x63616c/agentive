@@ -56,15 +56,10 @@ impl TemporalPayloadCodecTrait for TemporalPayloadCodec {
         let pipeline = self.pipeline.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                payloads
-                    .into_iter()
-                    .map(|payload| {
-                        pipeline
-                            .encode(from_temporal(payload))
-                            .map(into_temporal)
-                            .map_err(codec_error)
-                    })
-                    .collect()
+                pipeline
+                    .encode_batch(payloads.into_iter().map(from_temporal).collect())
+                    .map(|payloads| payloads.into_iter().map(into_temporal).collect())
+                    .map_err(codec_error)
             })
             .await
             .map_err(|error| PayloadConversionError::EncodingError(Box::new(error)))?
@@ -79,15 +74,10 @@ impl TemporalPayloadCodecTrait for TemporalPayloadCodec {
         let pipeline = self.pipeline.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                payloads
-                    .into_iter()
-                    .map(|payload| {
-                        pipeline
-                            .decode(from_temporal(payload))
-                            .map(into_temporal)
-                            .map_err(codec_error)
-                    })
-                    .collect()
+                pipeline
+                    .decode_batch(payloads.into_iter().map(from_temporal).collect())
+                    .map(|payloads| payloads.into_iter().map(into_temporal).collect())
+                    .map_err(codec_error)
             })
             .await
             .map_err(|error| PayloadConversionError::EncodingError(Box::new(error)))?

@@ -3,13 +3,62 @@
 #![allow(clippy::expect_used)]
 
 use agentive::{
-    Agent, DelegationTool, ModelFinishReason, ModelResponse, ProviderError, ProviderErrorKind,
-    RunEvent, RunOptions, RunStatus, ToolName,
+    Agent, ModelFinishReason, ModelResponse, ProviderError, ProviderErrorKind, RunEvent,
+    RunOptions, RunStatus, Tool, ToolContext, ToolError, ToolName,
 };
 use agentive_test::ScriptedProvider;
 use futures::StreamExt;
 use serde_json::json;
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+struct ParallelProbe {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl Tool for ParallelProbe {
+    fn name(&self) -> &ToolName {
+        static NAME: std::sync::OnceLock<ToolName> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| "parallel_probe".parse().expect("fixture tool name"))
+    }
+
+    fn description(&self) -> &'static str {
+        "Measure bounded child tool execution."
+    }
+
+    fn schema_json(&self) -> &serde_json::Value {
+        static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        SCHEMA.get_or_init(|| {
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            })
+        })
+    }
+
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
+    async fn call(
+        &self,
+        _: &ToolContext,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(json!({"ok": true}))
+    }
+}
 
 fn tool_call(name: &str, arguments: serde_json::Value) -> ModelResponse {
     ModelResponse {
@@ -55,6 +104,23 @@ fn parallel_delegations() -> ModelResponse {
                 call_id: call_id.to_string(),
                 name: "delegate".parse().expect("valid fixture tool name"),
                 arguments: json!({"task": call_id}),
+                provider_call_id: None,
+            })
+            .collect(),
+        usage: None,
+        finish_reason: ModelFinishReason::ToolCalls,
+    }
+}
+
+fn parallel_probe_calls() -> ModelResponse {
+    ModelResponse {
+        text: None,
+        tool_calls: ["probe-one", "probe-two"]
+            .into_iter()
+            .map(|call_id| agentive::ModelToolCall {
+                call_id: call_id.to_string(),
+                name: "parallel_probe".parse().expect("fixture tool name"),
+                arguments: json!({}),
                 provider_call_id: None,
             })
             .collect(),
@@ -119,13 +185,13 @@ async fn delegation_is_an_explicit_tool_and_keeps_child_history_private() {
 
 #[tokio::test]
 async fn parent_cancellation_cancels_an_active_child_run() {
+    let child_provider = ScriptedProvider::new()
+        .respond_with(tool_call("missing", json!({})))
+        .delay(Duration::from_secs(10))
+        .respond_with_text("too late");
     let child = Agent::builder()
         .name("slow-child")
-        .provider(
-            ScriptedProvider::new()
-                .delay(Duration::from_secs(10))
-                .respond_with_text("too late"),
-        )
+        .provider(child_provider.clone())
         .build()
         .expect("child agent");
     let parent = Agent::builder()
@@ -146,6 +212,8 @@ async fn parent_cancellation_cancels_an_active_child_run() {
         .expect("cancelled run is an outcome");
 
     assert_eq!(result.status, RunStatus::Cancelled);
+    assert_eq!(result.usage.model_calls.len(), 2);
+    assert_eq!(child_provider.cancellation_count(), 1);
 }
 
 #[tokio::test]
@@ -222,10 +290,12 @@ async fn child_failure_is_a_safe_correlated_tool_result() {
     let child = Agent::builder()
         .name("failing-child")
         .provider(
-            ScriptedProvider::new().respond_with_error(ProviderError::terminal(
-                ProviderErrorKind::Authentication,
-                "private child credential diagnostic",
-            )),
+            ScriptedProvider::new()
+                .respond_with(tool_call("missing", json!({})))
+                .respond_with_error(ProviderError::terminal(
+                    ProviderErrorKind::Authentication,
+                    "private child credential diagnostic",
+                )),
         )
         .build()
         .expect("child agent");
@@ -234,10 +304,8 @@ async fn child_failure_is_a_safe_correlated_tool_result() {
         .respond_with_text("recovered");
     let parent = Agent::builder()
         .provider(parent_provider.clone())
-        .tool(
-            DelegationTool::new("delegate", "Delegate a focused task.", child)
-                .expect("delegation tool"),
-        )
+        .delegate("delegate", "Delegate a focused task.", child)
+        .expect("delegation tool")
         .build()
         .expect("parent agent");
 
@@ -256,6 +324,8 @@ async fn child_failure_is_a_safe_correlated_tool_result() {
     };
     assert!(tool_text.contains("delegation_failed"));
     assert!(!tool_text.contains("private child credential diagnostic"));
+    assert_eq!(result.usage.model_calls.len(), 4);
+    assert_eq!(result.usage.aggregate.provider_total, None);
 }
 
 #[tokio::test]
@@ -283,7 +353,7 @@ async fn delegation_reserves_the_parent_tree_budget_and_forwards_attributed_even
         "start",
         RunOptions {
             model_call_limit: 3,
-            token_limit: Some(1_000),
+            token_limit: Some(100_000),
             ..RunOptions::default()
         },
     );
@@ -311,7 +381,11 @@ async fn delegation_reserves_the_parent_tree_budget_and_forwards_attributed_even
             break;
         }
     }
-    let result = wait.await.expect("wait task").expect("parent result");
+    let result = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("run result must advance")
+        .expect("wait task")
+        .expect("parent result");
 
     assert_eq!(result.status, RunStatus::Completed);
     child_provider.assert_request_count(1);
@@ -429,4 +503,49 @@ async fn parallel_delegations_receive_deterministic_bounded_reservations() {
 
     assert_eq!(result.status, RunStatus::Completed);
     child_provider.assert_request_count(2);
+}
+
+#[tokio::test]
+async fn delegated_children_inherit_the_parent_parallel_tool_limit() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let child = Agent::builder()
+        .name("bounded-child")
+        .provider(
+            ScriptedProvider::new()
+                .respond_with(parallel_probe_calls())
+                .respond_with_text("child done"),
+        )
+        .tool(ParallelProbe {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        })
+        .build()
+        .expect("child");
+    let parent = Agent::builder()
+        .name("bounded-parent")
+        .provider(
+            ScriptedProvider::new()
+                .respond_with(tool_call("delegate", json!({"task":"bounded work"})))
+                .respond_with_text("parent done"),
+        )
+        .delegate("delegate", "Delegate bounded work.", child)
+        .expect("delegate")
+        .build()
+        .expect("parent");
+
+    let result = parent
+        .run_with_options(
+            "start",
+            RunOptions {
+                model_call_limit: 4,
+                max_parallel_tool_calls: 1,
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("parent result");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
 }

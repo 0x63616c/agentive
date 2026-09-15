@@ -1,6 +1,7 @@
 //! Client-side Temporal run control over the durable Agentive workflow.
 
 use agentive::AgentRunState;
+use std::sync::{Arc, RwLock};
 use temporalio_client::{
     Client, WorkflowCancelOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
     WorkflowStartOptions,
@@ -9,7 +10,10 @@ use temporalio_client::{
     },
 };
 
-use super::{AgentiveWorkflow, TemporalRunConfig, TemporalRunSnapshot, TemporalWorkflowInput};
+use super::{
+    AgentiveWorkflow, TemporalRunConfig, TemporalRunCursor, TemporalRunSnapshot,
+    TemporalWorkflowInput,
+};
 
 /// Starts and reconnects to Agentive Temporal workflow executions.
 #[derive(Clone, Debug)]
@@ -42,6 +46,7 @@ impl TemporalRuntime {
         Ok(TemporalRunHandle {
             client: self.client.clone(),
             workflow_id,
+            terminal_state: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -51,6 +56,7 @@ impl TemporalRuntime {
         TemporalRunHandle {
             client: self.client.clone(),
             workflow_id: workflow_id.into(),
+            terminal_state: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -60,6 +66,7 @@ impl TemporalRuntime {
 pub struct TemporalRunHandle {
     client: Client,
     workflow_id: String,
+    terminal_state: Arc<RwLock<Option<AgentRunState>>>,
 }
 
 impl TemporalRunHandle {
@@ -78,6 +85,14 @@ impl TemporalRunHandle {
 
     /// Reads the latest committed state and its opaque progress cursor.
     pub async fn observe(&self) -> Result<Option<TemporalRunSnapshot>, WorkflowQueryError> {
+        if let Ok(state) = self.terminal_state.read()
+            && let Some(state) = state.as_ref()
+        {
+            return Ok(Some(TemporalRunSnapshot {
+                state: state.clone(),
+                cursor: TemporalRunCursor::terminal(),
+            }));
+        }
         self.workflow_handle()
             .query(
                 AgentiveWorkflow::observe,
@@ -89,9 +104,14 @@ impl TemporalRunHandle {
 
     /// Waits for the terminal canonical Agentive result, following Continue-As-New runs.
     pub async fn result(&self) -> Result<AgentRunState, WorkflowGetResultError> {
-        self.workflow_handle()
+        let state = self
+            .workflow_handle()
             .get_result(WorkflowGetResultOptions::default())
-            .await
+            .await?;
+        if let Ok(mut terminal_state) = self.terminal_state.write() {
+            *terminal_state = Some(state.clone());
+        }
+        Ok(state)
     }
 
     fn workflow_handle(&self) -> temporalio_client::WorkflowHandle<Client, AgentiveWorkflow> {

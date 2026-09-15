@@ -1,8 +1,8 @@
 //! Serializable state-machine data contracts.
 
 use crate::{
-    AllOrError, CompiledInstructions, Message, ModelRequest, ModelToolCall, ProviderToolDescriptor,
-    RunStatus, RunUsage, ToolInvocation, ToolName,
+    AllOrError, CompiledInstructions, Message, ModelOutputFormat, ModelRequest, ModelToolCall,
+    ProviderToolDescriptor, RunStatus, RunUsage, ToolInvocation, ToolName,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +14,9 @@ pub enum StateTransitionError {
     /// A stale, duplicate, or out-of-order effect was completed.
     #[error("unexpected effect `{received}`; expected {expected:?}")]
     UnexpectedEffect {
+        /// Identity of the completed effect received by the state machine.
         received: String,
+        /// Identity of the effect currently expected, when one is pending.
         expected: Option<String>,
     },
 }
@@ -53,6 +55,9 @@ pub struct AgentRunPlan {
     pub model: Option<String>,
     /// Output capacity reserved for each provider call.
     pub max_output_tokens: u64,
+    /// Canonical output contract for each provider call.
+    #[serde(default)]
+    pub output_format: ModelOutputFormat,
     /// Maximum attempts for one provider effect; one preserves the safe default.
     pub provider_max_attempts: u8,
     /// Maximum concurrent members of one explicitly parallel-safe batch.
@@ -98,8 +103,11 @@ pub struct AgentRunState {
     pub usage: RunUsage,
     /// Limits carried with the state for replay-equivalent admission.
     pub budget: AgentRunBudget,
-    /// Number of provider effects committed so far.
+    /// Number of logical provider effects committed so far.
     pub model_calls: u32,
+    /// Number of provider transport calls started, including retry attempts.
+    #[serde(default)]
+    pub provider_calls_started: u32,
     /// Runtime-reported elapsed wall time consumed by completed effects.
     pub elapsed_ms: u64,
     /// Model calls reserved by child runs started from this state.
@@ -135,8 +143,11 @@ pub enum AgentRunEffect {
     },
     /// Invoke one tool with stable logical identity.
     ToolCall {
+        /// Stable identity of this effect.
         effect_id: String,
+        /// Stable identity and runtime context for the invocation.
         invocation: ToolInvocation,
+        /// Model-provided JSON arguments.
         arguments: Value,
         /// Snapshotted retry/concurrency policy, if the model named a known tool.
         policy: Option<ToolRuntimePolicy>,

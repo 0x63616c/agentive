@@ -19,6 +19,7 @@ pub struct PayloadPipelineBuilder {
     storages: BTreeMap<StorageId, Arc<dyn StorageDriver>>,
     default_storage: Option<StorageId>,
     codecs: Vec<Arc<dyn PayloadCodec>>,
+    historical_fingerprints: BTreeSet<PipelineFingerprint>,
     limits: PayloadLimits,
 }
 impl PayloadPipelineBuilder {
@@ -59,6 +60,12 @@ impl PayloadPipelineBuilder {
         self
     }
     #[must_use]
+    /// Permits decoding references written by one explicitly known historical configuration.
+    pub fn historical_fingerprint(mut self, fingerprint: PipelineFingerprint) -> Self {
+        self.historical_fingerprints.insert(fingerprint);
+        self
+    }
+    #[must_use]
     /// Applies bounded read and decompression limits.
     pub fn limits(mut self, limits: PayloadLimits) -> Self {
         self.limits = limits;
@@ -90,8 +97,12 @@ impl PayloadPipelineBuilder {
                 }
             }
         }
+        let fingerprint = PipelineFingerprint::calculate(&default_storage, &self.codecs)?;
+        let mut accepted_fingerprints = self.historical_fingerprints;
+        accepted_fingerprints.insert(fingerprint.clone());
         Ok(PayloadPipeline {
-            fingerprint: PipelineFingerprint::calculate(&default_storage, &self.codecs)?,
+            fingerprint,
+            accepted_fingerprints,
             storages: self.storages,
             default_storage,
             codecs: self.codecs,
@@ -108,7 +119,15 @@ pub struct PayloadPipeline {
     codecs: Vec<Arc<dyn PayloadCodec>>,
     limits: PayloadLimits,
     fingerprint: PipelineFingerprint,
+    accepted_fingerprints: BTreeSet<PipelineFingerprint>,
 }
+
+struct PreparedPayload {
+    bytes: Vec<u8>,
+    codecs: Vec<CodecUse>,
+    decoded_size: usize,
+}
+
 impl PayloadPipeline {
     /// Creates a one-store pipeline with no transforms.
     /// # Errors
@@ -138,7 +157,12 @@ impl PayloadPipeline {
     /// # Errors
     /// Returns typed serialization, codec, or storage errors.
     pub fn encode(&self, payload: Payload) -> Result<Payload, PayloadError> {
+        self.store_prepared(self.prepare(payload)?)
+    }
+
+    fn prepare(&self, payload: Payload) -> Result<PreparedPayload, PayloadError> {
         let mut bytes = serde_json::to_vec(&payload)?;
+        let decoded_size = bytes.len();
         if bytes.len() > self.limits.decoded_payload_bytes() {
             return Err(PayloadError::SizeLimit {
                 kind: "decoded payload",
@@ -161,21 +185,51 @@ impl PayloadPipeline {
         if bytes.len() > self.limits.batch_bytes() {
             return Err(PayloadError::SizeLimit { kind: "batch" });
         }
+        Ok(PreparedPayload {
+            bytes,
+            codecs: used,
+            decoded_size,
+        })
+    }
+
+    fn store_prepared(&self, prepared: PreparedPayload) -> Result<Payload, PayloadError> {
         let object_id = ObjectId::random();
         let key = ObjectKey::v1_for(object_id);
         self.storages
             .get(&self.default_storage)
             .ok_or(PayloadError::UnknownStorage)?
-            .create_immutable(&key, &bytes)?;
+            .create_immutable(&key, &prepared.bytes)?;
         let reference = ExternalReference::new(
             self.default_storage.clone(),
             object_id,
-            &bytes,
-            used,
+            &prepared.bytes,
+            prepared.codecs,
             &self.fingerprint,
         )?;
         Ok(Payload::new(serde_json::to_vec(&reference)?)
             .with_metadata("encoding", REFERENCE_MARKER.as_bytes().to_vec()))
+    }
+    /// Encodes a Temporal payload batch while enforcing aggregate decoded and stored limits.
+    pub fn encode_batch(&self, payloads: Vec<Payload>) -> Result<Vec<Payload>, PayloadError> {
+        let mut decoded_total = 0_usize;
+        let mut stored_total = 0_usize;
+        let mut prepared = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let payload = self.prepare(payload)?;
+            decoded_total = decoded_total.saturating_add(payload.decoded_size);
+            if decoded_total > self.limits.batch_bytes() {
+                return Err(PayloadError::SizeLimit { kind: "batch" });
+            }
+            stored_total = stored_total.saturating_add(payload.bytes.len());
+            if stored_total > self.limits.batch_bytes() {
+                return Err(PayloadError::SizeLimit { kind: "batch" });
+            }
+            prepared.push(payload);
+        }
+        prepared
+            .into_iter()
+            .map(|payload| self.store_prepared(payload))
+            .collect()
     }
     /// Resolves an external reference, verifies it, reverses transforms, and deserializes. Plain payloads pass through unchanged.
     /// # Errors
@@ -190,7 +244,7 @@ impl PayloadPipeline {
         }
         let reference: ExternalReference =
             serde_json::from_slice(payload.data()).map_err(|_| PayloadError::MalformedReference)?;
-        reference.validate(self.limits, &self.fingerprint)?;
+        reference.validate(self.limits, &self.accepted_fingerprints)?;
         let encoded_size =
             usize::try_from(reference.encoded_size).map_err(|_| PayloadError::SizeLimit {
                 kind: "stored payload",
@@ -222,5 +276,35 @@ impl PayloadPipeline {
             }
         }
         serde_json::from_slice(&bytes).map_err(|_| PayloadError::MalformedReference)
+    }
+    /// Decodes a Temporal payload batch with aggregate external-read and decoded limits.
+    pub fn decode_batch(&self, payloads: Vec<Payload>) -> Result<Vec<Payload>, PayloadError> {
+        let mut stored_total = 0_usize;
+        for payload in &payloads {
+            if payload.is_external_reference() {
+                let reference: ExternalReference = serde_json::from_slice(payload.data())
+                    .map_err(|_| PayloadError::MalformedReference)?;
+                stored_total = stored_total.saturating_add(
+                    usize::try_from(reference.encoded_size)
+                        .map_err(|_| PayloadError::SizeLimit { kind: "batch" })?,
+                );
+            } else {
+                stored_total = stored_total.saturating_add(payload.data().len());
+            }
+            if stored_total > self.limits.batch_bytes() {
+                return Err(PayloadError::SizeLimit { kind: "batch" });
+            }
+        }
+        let mut decoded_total = 0_usize;
+        let mut decoded = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let payload = self.decode(payload)?;
+            decoded_total = decoded_total.saturating_add(serde_json::to_vec(&payload)?.len());
+            if decoded_total > self.limits.batch_bytes() {
+                return Err(PayloadError::SizeLimit { kind: "batch" });
+            }
+            decoded.push(payload);
+        }
+        Ok(decoded)
     }
 }

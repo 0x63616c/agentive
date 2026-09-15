@@ -1,10 +1,11 @@
 use super::{RunEvent, RunResult, RunStatus};
 use crate::RunId;
+use crate::RunUsage;
 use crate::errors::RunError;
 use crate::tool::{CancellationReason, CancellationToken};
 use futures::stream::unfold;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Clone)]
@@ -29,6 +30,7 @@ pub struct RunHandle {
     pub(super) cancellation_token: CancellationToken,
     pub(super) result_tx: watch::Sender<Option<Result<RunResult, RunError>>>,
     pub(super) events_tx: EventBus,
+    pub(super) usage: Arc<std::sync::Mutex<RunUsage>>,
 }
 impl RunHandle {
     /// Opaque identity allocated for this run.
@@ -51,7 +53,10 @@ impl RunHandle {
     }
     /// Subscribe to lifecycle events.
     pub fn events(&self) -> impl futures::Stream<Item = RunEvent> {
-        let receiver = self.events_tx.subscribe();
+        let receiver = self
+            .events_tx
+            .take_attached()
+            .unwrap_or_else(|| self.events_tx.subscribe());
         unfold(receiver, |mut receiver| async move {
             receiver.recv().await.map(|item| (item, receiver))
         })
@@ -69,11 +74,28 @@ impl RunHandle {
                 .map_err(|_| RunError::Provider("run task cancelled unexpectedly".to_string()))?;
         }
     }
+    /// Returns usage committed so far, including terminal failed provider attempts.
+    pub fn usage(&self) -> RunUsage {
+        self.usage.lock().map_or_else(
+            |_| RunUsage {
+                aggregate: crate::TokenUsage::unknown(),
+                complete: false,
+                model_calls: Vec::new(),
+            },
+            |usage| usage.clone(),
+        )
+    }
+
+    pub(crate) fn usage_snapshot(&self) -> RunUsage {
+        self.usage()
+    }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct EventBus {
     observers: Arc<std::sync::Mutex<Vec<mpsc::Sender<RunEvent>>>>,
+    attached: Arc<std::sync::Mutex<Option<mpsc::Receiver<RunEvent>>>>,
+    closed: Arc<AtomicBool>,
     parent: Option<Arc<EventBus>>,
     child_run_id: Option<String>,
 }
@@ -82,6 +104,16 @@ pub(crate) struct RunObserver {
     events: EventBus,
 }
 impl EventBus {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(256);
+        Self {
+            observers: Arc::new(std::sync::Mutex::new(vec![sender])),
+            attached: Arc::new(std::sync::Mutex::new(Some(receiver))),
+            closed: Arc::new(AtomicBool::new(false)),
+            parent: None,
+            child_run_id: None,
+        }
+    }
     pub(super) fn observer(&self) -> RunObserver {
         RunObserver {
             events: self.clone(),
@@ -90,16 +122,37 @@ impl EventBus {
     pub(super) fn observed_by(observer: RunObserver, run_id: String) -> Self {
         Self {
             observers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attached: Arc::new(std::sync::Mutex::new(None)),
+            closed: Arc::new(AtomicBool::new(false)),
             parent: Some(Arc::new(observer.events)),
             child_run_id: Some(run_id),
         }
     }
     pub(super) fn subscribe(&self) -> mpsc::Receiver<RunEvent> {
         let (sender, receiver) = mpsc::channel(256);
-        if let Ok(mut observers) = self.observers.lock() {
+        if !self.closed.load(Ordering::Acquire)
+            && let Ok(mut observers) = self.observers.lock()
+        {
             observers.push(sender);
         }
         receiver
+    }
+    fn take_attached(&self) -> Option<mpsc::Receiver<RunEvent>> {
+        self.attached
+            .lock()
+            .ok()
+            .and_then(|mut attached| attached.take())
+    }
+    pub(super) fn detach_attached(&self) {
+        if let Ok(mut attached) = self.attached.lock() {
+            attached.take();
+        }
+    }
+    pub(super) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut observers) = self.observers.lock() {
+            observers.clear();
+        }
     }
     pub(super) async fn emit(&self, event: RunEvent) {
         let observers = self
@@ -119,6 +172,16 @@ impl EventBus {
             }))
             .await;
         }
+    }
+}
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl RunObserver {
+    pub(crate) async fn emit(&self, event: RunEvent) {
+        self.events.emit(event).await;
     }
 }
 pub(super) async fn emit_event(events: &EventBus, event: RunEvent) {

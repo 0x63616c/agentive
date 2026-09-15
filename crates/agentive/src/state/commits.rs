@@ -1,7 +1,9 @@
 //! Effect completion and terminal transitions.
 
 use super::{AgentRunEffect, AgentRunState, DelegationBudget, StateTransitionError};
-use crate::{AgentEffectOutcome, Message, ModelResponse, RunStatus, RunUsage};
+use crate::{
+    AgentEffectOutcome, Message, ModelResponse, ProviderAttempt, ProviderError, RunStatus, RunUsage,
+};
 use serde_json::{Value, json};
 
 impl AgentRunState {
@@ -11,13 +13,24 @@ impl AgentRunState {
         effect_id: &str,
         response: ModelResponse,
     ) -> Result<(), StateTransitionError> {
+        self.commit_provider_response_with_attempts(effect_id, response, Vec::new())
+    }
+
+    fn commit_provider_response_with_attempts(
+        &mut self,
+        effect_id: &str,
+        response: ModelResponse,
+        attempts: Vec<ProviderAttempt>,
+    ) -> Result<(), StateTransitionError> {
         self.expect_effect(effect_id, true)?;
         self.status = RunStatus::Running;
-        self.reserved_tokens = self
-            .reserved_tokens
-            .saturating_add(self.next_model_token_reservation());
+        self.reserve_provider_attempt_tokens(&attempts);
+        self.provider_calls_started = self
+            .provider_calls_started
+            .max(self.model_calls)
+            .saturating_add(provider_call_count(&attempts));
         self.model_calls = self.model_calls.saturating_add(1);
-        self.usage.add_call("model", response.usage.clone());
+        self.record_provider_attempts(attempts, response.usage.clone());
         if !response.tool_calls.is_empty() {
             self.history.push(Message::assistant_tool_calls(
                 response
@@ -50,8 +63,17 @@ impl AgentRunState {
         outcome: AgentEffectOutcome,
     ) -> Result<(), StateTransitionError> {
         match outcome {
-            AgentEffectOutcome::Provider { response } => {
-                self.commit_provider_response(effect_id, response)
+            AgentEffectOutcome::Provider { response, attempts } => {
+                self.commit_provider_response_with_attempts(effect_id, response, attempts)
+            }
+            AgentEffectOutcome::ProviderFailed { error, attempts } => {
+                self.commit_provider_failure(effect_id, error, attempts)
+            }
+            AgentEffectOutcome::ProviderBudgetExhausted { .. } => {
+                self.expect_effect(effect_id, true)?;
+                self.status = RunStatus::Incomplete;
+                self.usage.complete = false;
+                Ok(())
             }
             AgentEffectOutcome::Tool {
                 output,
@@ -86,15 +108,66 @@ impl AgentRunState {
 
     /// Records cancellation as a terminal transition.
     pub fn cancel(&mut self) {
-        self.status = RunStatus::Cancelled;
-        self.usage.complete = false;
+        if matches!(self.status, RunStatus::Pending | RunStatus::Running) {
+            self.status = RunStatus::Cancelled;
+            self.usage.complete = false;
+        }
     }
 
     /// Records a safe terminal runtime failure.
     pub fn fail(&mut self, message: impl Into<String>) {
-        self.status = RunStatus::Failed;
-        self.error = Some(message.into());
-        self.usage.complete = false;
+        if matches!(self.status, RunStatus::Pending | RunStatus::Running) {
+            self.status = RunStatus::Failed;
+            self.error = Some(message.into());
+        }
+    }
+
+    fn commit_provider_failure(
+        &mut self,
+        effect_id: &str,
+        error: ProviderError,
+        attempts: Vec<ProviderAttempt>,
+    ) -> Result<(), StateTransitionError> {
+        self.expect_effect(effect_id, true)?;
+        self.reserve_provider_attempt_tokens(&attempts);
+        self.provider_calls_started = self
+            .provider_calls_started
+            .max(self.model_calls)
+            .saturating_add(provider_call_count(&attempts));
+        self.model_calls = self.model_calls.saturating_add(1);
+        self.record_provider_attempts(attempts, error.usage().cloned());
+        self.fail(error.message);
+        Ok(())
+    }
+
+    fn record_provider_attempts(
+        &mut self,
+        attempts: Vec<ProviderAttempt>,
+        legacy_or_final_usage: Option<crate::ModelTokenUsage>,
+    ) {
+        if attempts.is_empty() {
+            self.usage.add_call("model", legacy_or_final_usage);
+        } else {
+            for attempt in attempts {
+                self.usage.add_call("model", attempt.usage);
+            }
+        }
+    }
+
+    fn reserve_provider_attempt_tokens(&mut self, attempts: &[ProviderAttempt]) {
+        let provider_derived = (!attempts.is_empty())
+            .then(|| {
+                attempts.iter().try_fold(0_u64, |total, attempt| {
+                    (attempt.reserved_tokens > 0)
+                        .then(|| total.saturating_add(attempt.reserved_tokens))
+                })
+            })
+            .flatten();
+        let reservation = provider_derived.unwrap_or_else(|| {
+            self.next_model_token_reservation()
+                .saturating_mul(u64::from(provider_call_count(attempts)))
+        });
+        self.reserved_tokens = self.reserved_tokens.saturating_add(reservation);
     }
 
     fn commit_tool_batch(
@@ -202,4 +275,8 @@ fn effect_id(effect: &AgentRunEffect) -> String {
         | AgentRunEffect::ToolCall { effect_id, .. }
         | AgentRunEffect::ToolBatch { effect_id, .. } => effect_id.clone(),
     }
+}
+
+fn provider_call_count(attempts: &[ProviderAttempt]) -> u32 {
+    u32::try_from(attempts.len()).unwrap_or(u32::MAX).max(1)
 }

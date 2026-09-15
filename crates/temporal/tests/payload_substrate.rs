@@ -8,6 +8,7 @@ use agentive_temporal::{
     CodecServer, FilesystemStorage, InMemoryStorage, ObjectId, ObjectKey, Payload, PayloadPipeline,
     StorageDriver, StorageId, ZstdCodec,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use proptest::prelude::*;
 use temporalio_common::data_converters::{DataConverter, SerializationContextData};
 
@@ -49,12 +50,84 @@ fn in_memory_pipeline_always_externalizes_and_round_trips() -> Result<(), Box<dy
 }
 
 #[test]
+fn migrated_pipeline_reads_an_explicitly_accepted_historical_reference()
+-> Result<(), Box<dyn std::error::Error>> {
+    let old_storage = InMemoryStorage::new();
+    let old = PayloadPipeline::single_store(old_storage.clone(), StorageId::new("old-store")?)?;
+    let encoded = old.encode(Payload::new(b"historical".to_vec()))?;
+    let migrated = PayloadPipeline::builder()
+        .storage(StorageId::new("old-store")?, old_storage)?
+        .storage(StorageId::new("new-store")?, InMemoryStorage::new())?
+        .default_storage(StorageId::new("new-store")?)
+        .historical_fingerprint(old.fingerprint().clone())
+        .build()?;
+    assert_eq!(migrated.decode(encoded)?.data(), b"historical");
+    Ok(())
+}
+
+#[test]
 fn codec_server_uses_the_same_public_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline =
         PayloadPipeline::single_store(InMemoryStorage::new(), StorageId::new("server")?)?;
     let encoded = pipeline.encode(Payload::new(b"codec server".to_vec()))?;
     let server = CodecServer::new(pipeline);
     assert_eq!(server.decode_payload(encoded)?.data(), b"codec server");
+    Ok(())
+}
+
+#[tokio::test]
+async fn codec_server_uses_temporals_payloads_and_base64_json_wire_shape()
+-> Result<(), Box<dyn std::error::Error>> {
+    use http::Request;
+    use tower::ServiceExt;
+
+    let pipeline = PayloadPipeline::single_store(InMemoryStorage::new(), StorageId::new("wire")?)?;
+    let encoded = pipeline.encode(Payload::new(b"decoded through UI".to_vec()))?;
+    let metadata = encoded
+        .metadata()
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                serde_json::Value::String(STANDARD.encode(value)),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "payloads": [{"metadata": metadata, "data": STANDARD.encode(encoded.data())}]
+    }))?;
+
+    let response = CodecServer::new(pipeline)
+        .oneshot(Request::post("/decode").body(body)?)
+        .await?;
+    let decoded: agentive_temporal::CodecServerResponse = serde_json::from_slice(response.body())?;
+    let payloads = decoded.into_payloads()?;
+
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].data(), b"decoded through UI");
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(response.body())?["payloads"][0]["data"]
+            .is_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn aggregate_batch_limits_reject_multiple_individually_valid_payloads()
+-> Result<(), Box<dyn std::error::Error>> {
+    use agentive_temporal::PayloadLimits;
+
+    let pipeline = PayloadPipeline::builder()
+        .storage(StorageId::new("batch")?, InMemoryStorage::new())?
+        .default_storage(StorageId::new("batch")?)
+        .limits(PayloadLimits::new(2_048, 1_024)?)
+        .build()?;
+    let payload = Payload::new(vec![b'x'; 150]);
+    assert!(pipeline.encode(payload.clone()).is_ok());
+    assert!(matches!(
+        pipeline.encode_batch(vec![payload.clone(), payload]),
+        Err(agentive_temporal::PayloadError::SizeLimit { kind: "batch" })
+    ));
     Ok(())
 }
 
@@ -183,8 +256,8 @@ async fn axum_adapter_honors_pipeline_limit_above_axums_default()
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
-    // `Vec<u8>` is JSON-encoded as numbers, so 3 MiB of padding expands well
-    // past its raw byte count while still testing the configured admission path.
+    // Base64 expansion keeps this body above Axum's generic 2 MiB default while
+    // remaining below the codec server's wire-safe expansion of the pipeline limit.
     let limit = 20 * 1024 * 1024;
     let pipeline = PayloadPipeline::builder()
         .storage(StorageId::new("axum")?, InMemoryStorage::new())?

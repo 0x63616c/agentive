@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::{Duration, timeout};
 
 /// The default local stdio transport.
 #[derive(Clone, Debug)]
@@ -88,6 +89,32 @@ impl CodexSession for StdioSession {
             serde_json::from_str(&line)
                 .map(Some)
                 .map_err(|_| protocol_error())
+        })
+    }
+
+    fn shutdown(&mut self) -> BoxFuture<'_, Result<(), ProviderError>> {
+        Box::pin(async move {
+            if self
+                .child
+                .try_wait()
+                .map_err(|_| transport_error())?
+                .is_some()
+            {
+                return Ok(());
+            }
+            // Closing stdin asks App Server to exit normally. A concurrent exit
+            // may make the close itself fail, but the authoritative operation is
+            // still waiting for and reaping the child below.
+            let _ = self.stdin.shutdown().await;
+            match timeout(Duration::from_secs(2), self.child.wait()).await {
+                Ok(Ok(_status)) => {}
+                Ok(Err(_)) => return Err(transport_error()),
+                Err(_) => {
+                    self.child.kill().await.map_err(|_| transport_error())?;
+                    self.child.wait().await.map_err(|_| transport_error())?;
+                }
+            }
+            Ok(())
         })
     }
 }

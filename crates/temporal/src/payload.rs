@@ -128,6 +128,32 @@ impl PayloadLimits {
 pub struct PipelineFingerprint([u8; 32]);
 
 impl PipelineFingerprint {
+    /// Parses the canonical lowercase hexadecimal fingerprint stored in a reference.
+    ///
+    /// # Errors
+    /// Returns an error for a non-canonical fingerprint.
+    pub fn parse(value: &str) -> Result<Self, PayloadError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PayloadError::InvalidInput {
+                kind: "pipeline fingerprint",
+                reason: "must be 64 lowercase hexadecimal characters",
+            });
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+                PayloadError::InvalidInput {
+                    kind: "pipeline fingerprint",
+                    reason: "must be 64 lowercase hexadecimal characters",
+                }
+            })?;
+        }
+        Ok(Self(bytes))
+    }
     pub(crate) fn calculate(
         default_storage: &StorageId,
         codecs: &[std::sync::Arc<dyn crate::PayloadCodec>],
@@ -197,7 +223,7 @@ impl ExternalReference {
     pub(crate) fn validate(
         &self,
         limits: PayloadLimits,
-        fingerprint: &PipelineFingerprint,
+        fingerprints: &std::collections::BTreeSet<PipelineFingerprint>,
     ) -> Result<(), PayloadError> {
         if self.version != REFERENCE_VERSION || self.encoded_size == 0 && !self.codecs.is_empty() {
             return Err(PayloadError::MalformedReference);
@@ -216,7 +242,10 @@ impl ExternalReference {
         {
             return Err(PayloadError::MalformedReference);
         }
-        if self.pipeline_fingerprint != fingerprint.to_hex() {
+        if !fingerprints
+            .iter()
+            .any(|fingerprint| self.pipeline_fingerprint == fingerprint.to_hex())
+        {
             return Err(PayloadError::PipelineMismatch);
         }
         Ok(())

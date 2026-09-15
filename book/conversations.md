@@ -5,14 +5,17 @@ Use `RunOptions::history` to continue a conversation:
 ```rust,ignore
 use agentive::{Message, RunOptions};
 
+# fn example() -> Result<(), agentive::MessageError> {
 let options = RunOptions {
     history: vec![
         Message::user("What is in this image?"),
-        Message::image_url("https://example.invalid/photo.png", "image/png"),
+        Message::image_url("https://example.invalid/photo.png", "image/png")?,
     ],
     ..RunOptions::default()
 };
 assert_eq!(options.history.len(), 2);
+# Ok(())
+# }
 ```
 
 URL and inline images are separate forms. `Message::image_inline` copies bytes into the message; `Message::image_url` records a URL and media type. Providers without image support reject unsupported content rather than silently changing it. V1 supports text and images only: generic files, audio, and video are not content types.

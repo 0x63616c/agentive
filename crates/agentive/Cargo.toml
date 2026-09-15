@@ -1,5 +1,5 @@
 [package]
-name = "agentive"
+name = "agentive-sdk"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,14 +9,19 @@ repository.workspace = true
 description = "Provider-neutral Rust SDK for explicit, testable agent workflows"
 readme = "../../README.md"
 
+[lib]
+name = "agentive"
+
 [dependencies]
 futures.workspace = true
+jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 agentive-macros.workspace = true
 

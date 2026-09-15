@@ -6,8 +6,10 @@ use std::{
     task::{Context, Poll},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tower::Service;
 
 use crate::{Payload, PayloadError, PayloadPipeline};
@@ -16,28 +18,83 @@ use crate::{Payload, PayloadError, PayloadPipeline};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodecServerRequest {
-    payload: Payload,
+    payloads: Vec<WirePayload>,
 }
 
 impl CodecServerRequest {
     /// Creates a decode request from one Temporal-compatible payload.
     #[must_use]
     pub fn new(payload: Payload) -> Self {
-        Self { payload }
+        Self::from_payloads([payload])
+    }
+
+    /// Creates a standard Temporal Codec Server request for a payload batch.
+    #[must_use]
+    pub fn from_payloads(payloads: impl IntoIterator<Item = Payload>) -> Self {
+        Self {
+            payloads: payloads.into_iter().map(WirePayload::from).collect(),
+        }
     }
 }
 
 /// Wire response emitted by the embeddable Codec Server Tower service.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodecServerResponse {
-    payload: Payload,
+    payloads: Vec<WirePayload>,
 }
 
 impl CodecServerResponse {
     /// Returns the decoded payload.
-    #[must_use]
-    pub fn payload(&self) -> &Payload {
-        &self.payload
+    pub fn into_payloads(self) -> Result<Vec<Payload>, PayloadError> {
+        self.payloads.into_iter().map(Payload::try_from).collect()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePayload {
+    metadata: BTreeMap<String, String>,
+    data: String,
+}
+
+impl From<Payload> for WirePayload {
+    fn from(payload: Payload) -> Self {
+        Self {
+            metadata: payload
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key.clone(), STANDARD.encode(value)))
+                .collect(),
+            data: STANDARD.encode(payload.data()),
+        }
+    }
+}
+
+impl TryFrom<WirePayload> for Payload {
+    type Error = PayloadError;
+
+    fn try_from(payload: WirePayload) -> Result<Self, Self::Error> {
+        let data = STANDARD
+            .decode(payload.data)
+            .map_err(|_| PayloadError::InvalidInput {
+                kind: "codec server payload",
+                reason: "payload data must be canonical base64",
+            })?;
+        let metadata = payload
+            .metadata
+            .into_iter()
+            .map(|(key, value)| {
+                STANDARD
+                    .decode(value)
+                    .map(|value| (key, value))
+                    .map_err(|_| PayloadError::InvalidInput {
+                        kind: "codec server payload",
+                        reason: "payload metadata must be canonical base64",
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(Payload::new(data).with_metadata_map(metadata))
     }
 }
 
@@ -62,6 +119,19 @@ impl CodecServer {
         self.pipeline.decode(payload)
     }
 
+    /// Decodes a standard Temporal payload batch through the configured pipeline.
+    pub fn decode_payloads(&self, payloads: Vec<Payload>) -> Result<Vec<Payload>, PayloadError> {
+        self.pipeline.decode_batch(payloads)
+    }
+
+    fn wire_body_limit(&self) -> usize {
+        self.pipeline
+            .limits()
+            .batch_bytes()
+            .saturating_mul(2)
+            .saturating_add(64 * 1024)
+    }
+
     pub(crate) fn response(status: StatusCode, value: impl Serialize) -> Response<Vec<u8>> {
         let body = serde_json::to_vec(&value)
             .unwrap_or_else(|_| b"{\"error\":\"response serialization failed\"}".to_vec());
@@ -81,7 +151,7 @@ impl CodecServer {
                 serde_json::json!({"error":"not found"}),
             );
         }
-        if request.body().len() > self.pipeline.limits().batch_bytes() {
+        if request.body().len() > self.wire_body_limit() {
             return Self::response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 serde_json::json!({"error":"payload exceeds configured batch limit"}),
@@ -89,9 +159,21 @@ impl CodecServer {
         }
         match serde_json::from_slice::<CodecServerRequest>(request.body())
             .map_err(PayloadError::from)
-            .and_then(|request| self.decode_payload(request.payload))
+            .and_then(|request| {
+                request
+                    .payloads
+                    .into_iter()
+                    .map(Payload::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .and_then(|payloads| self.decode_payloads(payloads))
         {
-            Ok(payload) => Self::response(StatusCode::OK, CodecServerResponse { payload }),
+            Ok(payloads) => Self::response(
+                StatusCode::OK,
+                CodecServerResponse {
+                    payloads: payloads.into_iter().map(WirePayload::from).collect(),
+                },
+            ),
             Err(error) => Self::response(
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"error":error.to_string(),"retry":format!("{:?}", error.retry_disposition())}),
@@ -122,7 +204,7 @@ pub fn axum_router(server: CodecServer) -> axum::Router {
         routing::any,
     };
     async fn delegate(State(server): State<CodecServer>, request: AxumRequest) -> Response<Body> {
-        let limit = server.pipeline.limits().batch_bytes();
+        let limit = server.wire_body_limit();
         let (parts, body) = request.into_parts();
         let bytes = match to_bytes(body, limit).await {
             Ok(bytes) => bytes,

@@ -5,7 +5,7 @@ use super::{
 use crate::errors::RunError;
 use crate::ids::RunId;
 use crate::tool::CancellationToken;
-use crate::{AgentRunBudget, AgentRunEffect, AgentRunPlan, AgentRunState, ToolRuntimePolicy};
+use crate::{AgentRunEffect, AgentRunState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ pub(super) struct RunExecution {
     pub(super) cancellation: Arc<AtomicBool>,
     pub(super) cancellation_token: CancellationToken,
     pub(super) events: EventBus,
+    pub(super) usage: Arc<std::sync::Mutex<crate::RunUsage>>,
 }
 
 pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, RunError> {
@@ -31,35 +32,13 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
         cancellation,
         cancellation_token,
         events,
+        usage,
     } = execution;
     let compiled = agent.compile_request(user_message, &options);
-    validate_history(&compiled.messages)?;
-    let plan = AgentRunPlan {
-        instructions: compiled.instructions,
-        tools: agent.tools.iter().map(policy_for).collect(),
-        model: None,
-        max_output_tokens: options.output_token_reserve,
-        provider_max_attempts: options.provider_max_attempts.max(1),
-        max_parallel_tool_calls: options.max_parallel_tool_calls.max(1),
-        context_estimate: options.context_estimate,
-        provider_enforced_limit_opt_out: options.provider_enforced_limit_opt_out,
-        deadline_ms: options
-            .deadline
-            .map(|value| value.as_millis().try_into().unwrap_or(u64::MAX)),
-        delegation_depth: options.delegation_depth,
-        max_delegation_depth: options.max_delegation_depth,
-        token_limit: options.token_limit,
-    };
-    let mut state = AgentRunState::with_plan(
-        run_id.to_string(),
-        compiled.messages,
-        AgentRunBudget {
-            model_call_limit: options.model_call_limit.try_into().unwrap_or(u32::MAX),
-        },
-        plan,
-    );
+    let mut state = agent.prepare_state(run_id.to_string(), compiled.messages, &options)?;
     let mut records = Vec::new();
     let started = Instant::now();
+    tracing::info!(run_id = %run_id, agent = agent.name(), "agentive run started");
     status.set(RunStatus::Running);
     emit_event(
         &events,
@@ -70,7 +49,7 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
     .await;
     loop {
         if cancellation.load(Ordering::SeqCst) {
-            return finish_cancelled(&mut state, &status, &events, records).await;
+            return finish_cancelled(&mut state, &status, &events, &usage, records).await;
         }
         if state.finish_if_exhausted() {
             status.set(state.status);
@@ -81,13 +60,19 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
                 },
             )
             .await;
-            return Ok(result_from_state(state, records));
+            return finish_with_usage(state, records, &usage);
         }
         let Some(effect) = state.next_effect() else {
-            return Ok(result_from_state(state, records));
+            return finish_with_usage(state, records, &usage);
         };
         let id = effect_id(&effect);
         let effect_started = Instant::now();
+        tracing::debug!(
+            run_id = %state.run_id,
+            effect_id = id,
+            effect_kind = effect_kind(&effect),
+            "agentive effect started"
+        );
         emit_started(&events, &effect).await;
         let outcome = match agent
             .execute_effect_with_observer(
@@ -100,10 +85,11 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
         {
             Ok(value) => value,
             Err(RunError::Cancelled) => {
-                return finish_cancelled(&mut state, &status, &events, records).await;
+                return finish_cancelled(&mut state, &status, &events, &usage, records).await;
             }
             Err(error) => {
                 state.fail(error.to_string());
+                update_usage(&usage, &state.usage);
                 status.set(RunStatus::Failed);
                 emit_event(
                     &events,
@@ -117,27 +103,58 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
         };
         emit_completed(&events, &effect, &outcome).await;
         if let AgentRunEffect::ProviderCall { round, request, .. } = &effect {
-            let AgentEffectOutcome::Provider { response } = &outcome else {
-                return Err(RunError::ProviderProtocol(
-                    "provider effect returned a tool outcome".into(),
-                ));
-            };
-            records.push(RunRecord {
-                model_call: *round,
-                request: request.clone(),
-                response: response.clone(),
-                elapsed_ms: elapsed(effect_started),
-            });
+            match &outcome {
+                AgentEffectOutcome::Provider { response, attempts } => records.push(RunRecord {
+                    model_call: *round,
+                    request: request.clone(),
+                    response: Some(response.clone()),
+                    error: None,
+                    attempts: attempts.clone(),
+                    elapsed_ms: elapsed(effect_started),
+                }),
+                AgentEffectOutcome::ProviderFailed { error, attempts } => {
+                    records.push(RunRecord {
+                        model_call: *round,
+                        request: request.clone(),
+                        response: None,
+                        error: Some(error.clone()),
+                        attempts: attempts.clone(),
+                        elapsed_ms: elapsed(effect_started),
+                    });
+                }
+                AgentEffectOutcome::ProviderBudgetExhausted { .. } => {}
+                AgentEffectOutcome::Tool { .. } | AgentEffectOutcome::ToolBatch { .. } => {
+                    return Err(RunError::ProviderProtocol(
+                        "provider effect returned a tool outcome".into(),
+                    ));
+                }
+            }
         }
+        let terminal_provider_failure =
+            matches!(outcome, AgentEffectOutcome::ProviderFailed { .. });
         state.record_elapsed(elapsed(effect_started));
         state
             .commit_effect(&id, outcome)
             .map_err(|error| RunError::ProviderProtocol(error.to_string()))?;
-        if !matches!(effect, AgentRunEffect::ProviderCall { .. }) {
+        tracing::debug!(run_id = %state.run_id, effect_id = id, "agentive effect committed");
+        update_usage(&usage, &state.usage);
+        if terminal_provider_failure {
+            status.set(RunStatus::Failed);
+            emit_event(
+                &events,
+                RunEvent::StatusChanged {
+                    status: RunStatus::Failed,
+                },
+            )
+            .await;
+            return finish_with_usage(state, records, &usage);
+        }
+        if !matches!(effect, AgentRunEffect::ProviderCall { .. }) && state.pending_tools.is_empty()
+        {
             validate_history(&state.history)?;
         }
         if started.elapsed() >= options.deadline.unwrap_or(Duration::MAX) {
-            return finish_cancelled(&mut state, &status, &events, records).await;
+            return finish_cancelled(&mut state, &status, &events, &usage, records).await;
         }
         if let Some(text) = state.text.clone() {
             status.set(RunStatus::Completed);
@@ -148,7 +165,7 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
                 },
             )
             .await;
-            return Ok(RunResult {
+            let result = RunResult {
                 run_id: state.run_id.clone(),
                 status: RunStatus::Completed,
                 text: Some(text),
@@ -156,26 +173,13 @@ pub(super) async fn execute_run(execution: RunExecution) -> Result<RunResult, Ru
                 usage: state.usage,
                 records,
                 error: None,
-            });
+            };
+            update_usage(&usage, &result.usage);
+            return Ok(result);
         }
     }
 }
 
-fn policy_for(registered: &crate::run::agent::RegisteredTool) -> ToolRuntimePolicy {
-    let tool = registered.tool();
-    ToolRuntimePolicy {
-        descriptor: crate::ProviderToolDescriptor {
-            name: tool.name().clone(),
-            description: tool.description().to_string(),
-            schema: tool.schema_json().clone(),
-            idempotent: tool.idempotent(),
-        },
-        idempotent: tool.idempotent(),
-        max_attempts: tool.max_attempts(),
-        parallel_safe: tool.parallel_safe(),
-        delegation: registered.delegation().is_some(),
-    }
-}
 async fn emit_started(events: &EventBus, effect: &AgentRunEffect) {
     match effect {
         AgentRunEffect::ProviderCall { round, .. } => {
@@ -207,7 +211,10 @@ async fn emit_started(events: &EventBus, effect: &AgentRunEffect) {
 }
 async fn emit_completed(events: &EventBus, effect: &AgentRunEffect, outcome: &AgentEffectOutcome) {
     match (effect, outcome) {
-        (AgentRunEffect::ProviderCall { round, .. }, AgentEffectOutcome::Provider { response }) => {
+        (
+            AgentRunEffect::ProviderCall { round, .. },
+            AgentEffectOutcome::Provider { response, .. },
+        ) => {
             emit_event(
                 events,
                 RunEvent::ModelCallCompleted {
@@ -252,9 +259,11 @@ async fn finish_cancelled(
     state: &mut AgentRunState,
     status: &AtomicRunStatus,
     events: &EventBus,
+    usage: &Arc<std::sync::Mutex<crate::RunUsage>>,
     records: Vec<RunRecord>,
 ) -> Result<RunResult, RunError> {
     state.cancel();
+    update_usage(usage, &state.usage);
     status.set(RunStatus::Cancelled);
     emit_event(
         events,
@@ -265,11 +274,32 @@ async fn finish_cancelled(
     .await;
     Ok(result_from_state(state.clone(), records))
 }
+fn finish_with_usage(
+    state: AgentRunState,
+    records: Vec<RunRecord>,
+    usage: &Arc<std::sync::Mutex<crate::RunUsage>>,
+) -> Result<RunResult, RunError> {
+    let result = result_from_state(state, records);
+    update_usage(usage, &result.usage);
+    Ok(result)
+}
+fn update_usage(target: &Arc<std::sync::Mutex<crate::RunUsage>>, usage: &crate::RunUsage) {
+    if let Ok(mut target) = target.lock() {
+        *target = usage.clone();
+    }
+}
 fn effect_id(effect: &AgentRunEffect) -> String {
     match effect {
         AgentRunEffect::ProviderCall { effect_id, .. }
         | AgentRunEffect::ToolCall { effect_id, .. }
         | AgentRunEffect::ToolBatch { effect_id, .. } => effect_id.clone(),
+    }
+}
+fn effect_kind(effect: &AgentRunEffect) -> &'static str {
+    match effect {
+        AgentRunEffect::ProviderCall { .. } => "provider",
+        AgentRunEffect::ToolCall { .. } => "tool",
+        AgentRunEffect::ToolBatch { .. } => "tool_batch",
     }
 }
 fn elapsed(start: Instant) -> u64 {
