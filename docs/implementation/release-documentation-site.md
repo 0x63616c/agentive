@@ -8,7 +8,7 @@ Rust developers can discover, install, and use every shipped v1 capability from 
 
 - Use mdBook as the Rust-native documentation generator.
 - Deploy static output with the official GitHub Pages Actions flow.
-- Target `https://0x63616c.github.io/agents-rust-sdk/` and set the same canonical link in the README after deployment succeeds.
+- Target `https://0x63616c.github.io/agentive/` and set the same canonical link in the README after deployment succeeds.
 - Keep the site source in the repository and require no database, application server, analytics, or third-party runtime.
 - Publish generated rustdoc separately through links rather than copying reference documentation into tutorials.
 
@@ -50,7 +50,7 @@ A restrained technical reference: crisp high-contrast typography, compact naviga
 1. A link checker fails on broken internal navigation and reference URLs under repository control.
 2. All included Rust examples compile against the workspace.
 3. mdBook builds with warnings treated as failures where supported.
-4. A local static-server smoke test loads the root and representative nested pages under the `/agents-rust-sdk/` base path.
+4. A local static-server smoke test loads the root and representative nested pages under the `/agentive/` base path.
 5. Automated accessibility checks cover headings, landmarks, link names, contrast, keyboard navigation, and overflow on representative pages.
 6. GitHub Pages deployment completes successfully from `main` using the repository's configured Pages environment.
 7. The live URL loads the deployed commit and the README link resolves to it.

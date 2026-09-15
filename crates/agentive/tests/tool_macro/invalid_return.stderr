@@ -1,0 +1,5 @@
+error: tool return type must be Result<Output, ToolError>
+ --> tests/tool_macro/invalid_return.rs:6:33
+  |
+6 | async fn invalid(args: Args) -> String { let _ = args; String::new() }
+  |                                 ^^^^^^

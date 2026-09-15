@@ -1,4 +1,4 @@
-# Agents Rust SDK v1 specification
+# Agentive Rust SDK v1 specification
 
 ## Status
 
@@ -78,7 +78,7 @@ Delivery is incremental: the local vertical core, Codex integration, sub-agent c
 ### Product boundary and workspace
 
 - Preserve useful core behavior from `agenticenv/agent-sdk-go` through idiomatic Rust APIs. Source and package-shape compatibility are not goals.
-- Begin with `agents`, `agents-macros`, `agents-test`, and the first working Codex integration crate. Add `agents-temporal` when that slice begins. Do not scaffold empty future crates.
+- Begin with `agentive`, `agentive-macros`, `agentive-test`, and the first working Codex integration crate. Add `agentive-temporal` when that slice begins. Do not scaffold empty future crates.
 - Keep provider, protocol, storage, telemetry-export, and durable-runtime dependencies outside core.
 - Use Tokio as the v1 runtime. Public streaming uses standard `Stream` vocabulary rather than Tokio channels.
 - Set workspace `rust-version = "1.94"` for v1. Test that exact MSRV alongside current stable, require every selected dependency to support it, and raise it only in a documented minor release.

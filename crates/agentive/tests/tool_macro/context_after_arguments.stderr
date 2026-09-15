@@ -1,0 +1,13 @@
+error: tool context must appear before the argument payload
+  --> tests/tool_macro/context_after_arguments.rs:12:5
+   |
+12 |     #[tool(context)] _context: &ToolContext,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `ToolContext` and `ToolError`
+ --> tests/tool_macro/context_after_arguments.rs:1:16
+  |
+1 | use agentive::{ToolContext, ToolError, tool};
+  |                ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

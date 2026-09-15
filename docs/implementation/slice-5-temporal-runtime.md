@@ -4,7 +4,7 @@
 
 The same agent state machine proven locally can run as a durable Temporal workflow, survive worker failure and replay, Continue-As-New before history limits, and move all codec-capable workflow/activity payloads through the Slice 4 filesystem pipeline without exposing references to agent code.
 
-The official Temporal Rust SDK is currently Public Preview. The integration remains isolated in `agents-temporal`, pins a tested compatibility range, and records any upstream limitation rather than weakening core semantics.
+The official Temporal Rust SDK reached 1.0 on September 4, 2026. The integration remains isolated in `agentive-temporal`, pins the tested 1.x compatibility range, and records any upstream limitation rather than weakening core semantics.
 
 ## Public seams
 
@@ -16,7 +16,7 @@ Temporal commands, activity payloads, history events, replay versions, task queu
 
 ## Capability gate before full implementation
 
-Before stabilizing public types, prove against the pinned Temporal Rust SDK that the adapter can control payload conversion on clients and workers, execute/replay workflows deterministically, cancel activities, and Continue-As-New. If a required hook is missing in the Public Preview SDK, document the exact upstream gap and isolate the smallest temporary adapter rather than forking agent semantics.
+Before stabilizing public types, prove against Temporal Rust SDK 1.0 that the adapter can control payload conversion on clients and workers, execute/replay workflows deterministically, cancel activities, and Continue-As-New. If a required hook is missing, document the exact upstream gap and isolate the smallest temporary adapter rather than forking agent semantics.
 
 ## Test-first tracer order
 
@@ -41,7 +41,7 @@ Before stabilizing public types, prove against the pinned Temporal Rust SDK that
 - A real ephemeral or local Temporal server test covers start, tool loop, cancellation, Continue-As-New, reconnect, and large-payload round trip.
 - Workflow code performs no nondeterministic time, randomness, filesystem, provider, or tool operation outside explicit Temporal effects.
 - All codec-capable Temporal payloads use External Storage; agent/activity interfaces never expose references.
-- The tested Temporal Rust SDK version and Public Preview compatibility policy are documented.
+- The tested Temporal Rust SDK version and stable-version compatibility policy are documented.
 - All prior slice gates remain green.
 
 ## Explicit non-goals

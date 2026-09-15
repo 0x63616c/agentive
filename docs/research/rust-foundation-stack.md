@@ -175,7 +175,7 @@ impl Tool for Weather {
 For stateless tools, the proc-macro crate provides an attribute such as:
 
 ```rust
-#[agents::tool(
+#[agentive::tool(
     name = "weather",
     description = "Fetch the current weather for a city."
 )]

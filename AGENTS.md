@@ -1,4 +1,4 @@
-# Agents Rust SDK contributor instructions
+# Agentive Rust SDK contributor instructions
 
 ### Guiding principles
 

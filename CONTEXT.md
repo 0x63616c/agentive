@@ -1,4 +1,4 @@
-# Agents Rust SDK
+# Agentive Rust SDK
 
 An SDK for defining and running provider-independent agent workflows in Rust.
 

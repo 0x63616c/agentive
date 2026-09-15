@@ -12,15 +12,15 @@ Tests and callers cross only these seams:
 2. `ModelProvider` for live and scripted model adapters.
 3. Typed `Tool` plus `#[tool]` for directly testable tool authoring.
 4. `RunHandle` and its event stream for status, cancellation, result, and observation.
-5. `ScriptedProvider` and the provider conformance entry point in `agents-test`.
+5. `ScriptedProvider` and the provider conformance entry point in `agentive-test`.
 
 Internal state transitions, channels, erased traits, retry machinery, schema validators, and task management are implementation details and are not directly tested.
 
 ## Workspace delivered by this slice
 
-- `agents`: provider-neutral types, traits, agent runtime, local executor, tools, events, limits, usage, and errors.
-- `agents-macros`: first-party `#[tool]` procedural macro.
-- `agents-test`: `ScriptedProvider`, request matchers, deterministic helpers, and provider conformance suite.
+- `agentive`: provider-neutral types, traits, agent runtime, local executor, tools, events, limits, usage, and errors.
+- `agentive-macros`: first-party `#[tool]` procedural macro.
+- `agentive-test`: `ScriptedProvider`, request matchers, deterministic helpers, and provider conformance suite.
 
 No provider transport, Temporal, storage, sub-agent, protocol, or documentation-site dependency belongs in these crates during this slice.
 

@@ -1,0 +1,23 @@
+[book]
+title = "Agentive"
+authors = ["Agentive contributors"]
+language = "en"
+src = "book"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[output.html]
+site-url = "/agentive/"
+git-repository-url = "https://github.com/0x63616c/agentive"
+edit-url-template = "https://github.com/0x63616c/agentive/edit/main/{path}"
+additional-css = ["theme/agentive.css"]
+additional-js = ["theme/agentive.js"]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 0

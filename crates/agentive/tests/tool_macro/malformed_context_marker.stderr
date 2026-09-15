@@ -1,0 +1,13 @@
+error: tool context parameters must use exactly `#[tool(context)]`
+  --> tests/tool_macro/malformed_context_marker.rs:11:5
+   |
+11 |     #[tool(not_context)] _context: &ToolContext,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `ToolContext` and `ToolError`
+ --> tests/tool_macro/malformed_context_marker.rs:1:16
+  |
+1 | use agentive::{ToolContext, ToolError, tool};
+  |                ^^^^^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -57,7 +57,7 @@ Disposition values are recommendations until the corresponding scope decision is
 | `internal/eventbus` | In-memory event fan-out | Internal bounded event delivery module | Foundation |
 | `internal/hooks` | LLM/tool/retrieval/memory hooks | Middleware implementation | Workflow SDK |
 | `internal/store` | Key/value helper | Add only when a concrete adapter requires it | Durability |
-| `internal/testing` | In-memory memory implementation | `agents-test` adapters | Knowledge |
+| `internal/testing` | In-memory memory implementation | `agentive-test` adapters | Knowledge |
 | `internal/types` | Shared domain and wire types | Newtypes/enums in owning Rust modules | Foundation onward |
 | `pkg/interfaces/conversation.go` | Conversation store contract | `ConversationStore` trait | Workflow SDK |
 | `pkg/conversation/inmem` | In-memory conversation | Test/default adapter | Workflow SDK |

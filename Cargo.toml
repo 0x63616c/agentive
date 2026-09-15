@@ -1,7 +1,53 @@
 [workspace]
 members = [
-  "agents",
-  "agents-macros",
-  "agents-test",
+  "crates/agentive",
+  "crates/codex",
+  "crates/macros",
+  "crates/test",
+  "crates/temporal",
 ]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+homepage = "https://0x63616c.github.io/agentive/"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0x63616c/agentive"
+rust-version = "1.94"
+
+[workspace.dependencies]
+agentive = { path = "crates/agentive", version = "0.1.0" }
+agentive-macros = { path = "crates/macros", version = "0.1.0" }
+agentive-test = { path = "crates/test", version = "0.1.0" }
+axum = "0.8"
+futures = "0.3"
+http = "1"
+proptest = "1"
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+temporalio-client = { version = "1.0.0", default-features = false }
+temporalio-common = { version = "1.0.0", default-features = false }
+temporalio-macros = "1.0.0"
+temporalio-sdk = { version = "1.0.0", default-features = false }
+temporalio-sdk-core = { version = "0.9.0", default-features = false }
+temporalio-workflow = "1.0.0"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tower = "0.5"
+tracing = "0.1"
+trybuild = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+await_holding_lock = "deny"

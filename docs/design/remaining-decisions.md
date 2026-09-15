@@ -18,7 +18,7 @@ The fastest response format is: `Accept all recommendations except <numbers>`, f
 
 - **A. One crate with feature flags.**
 - **B. Create the complete future workspace immediately.**
-- **C. Start with `agents`, `agents-macros`, `agents-test`, and the first working provider crates; add integration crates only when implementation begins.**
+- **C. Start with `agentive`, `agentive-macros`, `agentive-test`, and the first working provider crates; add integration crates only when implementation begins.**
 
 ### 3. Which async runtime does core support?
 
@@ -36,7 +36,7 @@ Rust itself has no LTS channel. Tokio dependencies should use a supported Tokio 
 
 ### 5. How are optional integrations packaged?
 
-- **A. Large feature matrix on `agents`.**
+- **A. Large feature matrix on `agentive`.**
 - **B. Separate crates for providers, protocols, stores, telemetry, and durable runtimes; core features remain small and additive.**
 - **C. Put every integration in downstream repositories.**
 

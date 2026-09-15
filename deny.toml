@@ -1,0 +1,41 @@
+# Dependency policy for the complete, locked workspace graph. Keep additions
+# deliberate: adding a license here is a compatibility and distribution choice.
+
+[graph]
+# Evaluate optional first-party integrations as CI does, not merely defaults.
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 1.0
+allow = [
+    # Project license and common Rust ecosystem licenses.
+    "MIT",
+    "Apache-2.0",
+    "0BSD",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    # Required by ICU data and libbz2-rs-sys in the resolved Temporal graph.
+    "Unicode-3.0",
+    "bzip2-1.0.6",
+    # Mozilla root-certificate data used by the Temporal HTTP/TLS stack.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

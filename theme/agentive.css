@@ -1,0 +1,6 @@
+:root { --agentive-rust: #e56b35; }
+.content main { max-width: 880px; }
+h1 { letter-spacing: -.035em; }
+h1::before { content: "◆ "; color: var(--agentive-rust); font-size: .7em; vertical-align: .15em; }
+code { border-radius: 4px; }
+pre { border: 1px solid rgba(229,107,53,.28); border-radius: 8px; }

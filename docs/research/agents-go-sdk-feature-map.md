@@ -303,12 +303,12 @@ Names are provisional; the boundary is the recommendation.
 
 | Layer | Suggested crate | Responsibility |
 |---|---|---|
-| Stable public core | `agents` | Agent builder, messages, provider/tool traits, loop, run handles, events, errors, policies |
-| Test support | `agents-test` | Scripted provider/tool/store, matchers, conformance suites, deterministic helpers |
+| Stable public core | `agentive` | Agent builder, messages, provider/tool traits, loop, run handles, events, errors, policies |
+| Test support | `agentive-test` | Scripted provider/tool/store, matchers, conformance suites, deterministic helpers |
 | Providers | `agents-openai`, `agents-anthropic`, etc. | Wire translation only |
 | Protocols | `agents-mcp`, `agents-a2a`, `agents-agui` | External protocol adapters |
 | Storage | `agents-redis`, `agents-pgvector`, etc. | Conversation, memory, and retrieval backends |
-| Durability | `agents-temporal`, `agents-restate`, optional local journal | Runtime adapters over the shared state machine |
+| Durability | `agentive-temporal`, `agentive-restate`, optional local journal | Runtime adapters over the shared state machine |
 | Telemetry | `agents-otel` | OpenTelemetry export and semantic mapping |
 | Developer tool | `agents-cli` | Optional CLI built only from public APIs |
 
